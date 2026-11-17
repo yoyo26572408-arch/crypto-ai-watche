@@ -34,5 +34,5 @@ jobs:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python -c "import ccxt; from crypto_ai_watcher import fetch_ohlcv, render_chart_png, send_telegram_photo; df=fetch_ohlcv(ccxt.bingx(),'BTC/USDT:USDT','1h',100); send_telegram_photo(render_chart_png(df,'BTC/USDT:USDT','1h',[float(df['close'].iloc[-1])]), '測試 K 線圖傳送成功 ✅')"
+        run: python crypto_ai_watcher.py
 
