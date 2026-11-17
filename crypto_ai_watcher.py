@@ -24,7 +24,7 @@ import requests
 EXCHANGE_ID = os.getenv("EXCHANGE_ID", "binance")  # 可改為 "bingx" 或 "binance"
 SYMBOLS = os.getenv("SYMBOLS", "BTC/USDT:USDT,ETH/USDT:USDT,SOL/USDT:USDT").split(",")
 TIMEFRAMES = os.getenv("TIMEFRAMES", "15m,1h").split(",")
-CANDLE_LIMIT = 150
+CANDLE_LIMIT = 720
 MIN_AI_CONFIDENCE = int(os.getenv("MIN_AI_CONFIDENCE", "7"))
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
@@ -214,8 +214,8 @@ def detect_sr_breakout_and_sweep(
     vol_ratio = float(last["volume"] / last["vol_ma20"]) if pd.notna(last["vol_ma20"]) and last["vol_ma20"] > 0 else 1.0
 
     # 取過去 10~80 根 K 線內的顯著波段高低點作為關鍵流動性水位
-    ref_highs = [p for i, p in highs if 10 <= (last_idx - i) <= 80]
-    ref_lows = [p for i, p in lows if 10 <= (last_idx - i) <= 80]
+    ref_highs = [p for i, p in highs if 10]
+    ref_lows = [p for i, p in lows if 10]
 
     if ref_highs:
         major_res = max(ref_highs[-3:]) if len(ref_highs) >= 3 else max(ref_highs)
