@@ -1,29 +1,31 @@
 """
-Crypto AI Market Watcher (15m / 1h)
+Crypto AI Market Watcher (with Candlestick Chart Image Alert)
 Detects:
   - Double Top / Double Bottom (M頭 / W底)
   - Head & Shoulders / Inverse H&S (頭肩頂 / 頭肩底)
   - Triangle Convergence (三角收斂)
   - Key S/R Breakout & Liquidity Sweep / Fakeout (關鍵支撐壓力突破 / 假跌破假突破)
-Then uses Gemini AI to filter noise and sends alerts via Telegram Bot.
+Then uses Gemini AI to filter noise and sends a candlestick chart + analysis to Telegram.
 """
 
 import argparse
+import io
 import json
 import os
 from datetime import datetime, timezone, timedelta
 from typing import Any
 
 import ccxt
+import mplfinance as mpf
 import numpy as np
 import pandas as pd
 import requests
 
 
 # ==================== 使用者設定區 ====================
-EXCHANGE_ID = os.getenv("EXCHANGE_ID", "binance")  # 可改為 "bingx" 或 "binance"
-SYMBOLS = os.getenv("SYMBOLS", "BTC/USDT:USDT,ETH/USDT:USDT,SOL/USDT:USDT,SUI/USDT:USDT,ZEC/USDT:USDT").split(",")
-TIMEFRAMES = os.getenv("TIMEFRAMES", "15m,1h").split(",")
+EXCHANGE_ID = os.getenv("EXCHANGE_ID", "bingx")
+SYMBOLS = os.getenv("SYMBOLS", "BTC/USDT:USDT,ETH/USDT:USDT,SOL/USDT:USDT").split(",")
+TIMEFRAMES = os.getenv("TIMEFRAMES", "1h,4h").split(",")
 CANDLE_LIMIT = 720
 MIN_AI_CONFIDENCE = int(os.getenv("MIN_AI_CONFIDENCE", "7"))
 
@@ -34,12 +36,11 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 # ======================================================
 
 
-def fetch_ohlcv(exchange: ccxt.Exchange, symbol: str, timeframe: str, limit: int = 150) -> pd.DataFrame:
+def fetch_ohlcv(exchange: ccxt.Exchange, symbol: str, timeframe: str, limit: int = 720) -> pd.DataFrame:
     """抓取 K 線資料並排除尚未收盤的最後一根 K 線"""
     ohlcv = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
     df = pd.DataFrame(ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"])
     df["dt"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
-    # 排除尚未收盤的最新 K 線，避免盤中假訊號
     if len(df) > 2:
         df = df.iloc[:-1].reset_index(drop=True)
     return df
@@ -78,14 +79,12 @@ def detect_double_top_bottom(
     last_close = float(df["close"].iloc[-1])
     last_idx = len(df) - 1
 
-    # M 頭：最近兩個波段高點高度相近 (誤差 <= 1.2%)，且中間有明顯回落頸線
     if len(highs) >= 2:
         (i1, p1), (i2, p2) = highs[-2], highs[-1]
         if 6 <= (i2 - i1) <= 60 and (last_idx - i2) <= 15:
             diff_pct = abs(p1 - p2) / max(p1, p2)
             if diff_pct <= 0.012:
                 neckline = float(df["low"].iloc[i1:i2 + 1].min())
-                # 跌破頸線或正在回測頸線附近 (1% 以內)
                 if last_close <= neckline * 1.005 and last_close >= neckline * 0.97:
                     status = "已跌破頸線" if last_close < neckline else "正在測試頸線支撐"
                     signals.append({
@@ -95,7 +94,6 @@ def detect_double_top_bottom(
                         "key_level": round(neckline, 4),
                     })
 
-    # W 底：最近兩個波段低點高度相近 (誤差 <= 1.2%)
     if len(lows) >= 2:
         (i1, p1), (i2, p2) = lows[-2], lows[-1]
         if 6 <= (i2 - i1) <= 60 and (last_idx - i2) <= 15:
@@ -121,7 +119,6 @@ def detect_head_and_shoulders(
     last_close = float(df["close"].iloc[-1])
     last_idx = len(df) - 1
 
-    # 頭肩頂
     if len(highs) >= 3:
         (i1, ls), (i2, head), (i3, rs) = highs[-3], highs[-2], highs[-1]
         if (last_idx - i3) <= 15 and head > ls * 1.005 and head > rs * 1.005:
@@ -138,7 +135,6 @@ def detect_head_and_shoulders(
                         "key_level": round(neckline, 4),
                     })
 
-    # 頭肩底
     if len(lows) >= 3:
         (i1, ls), (i2, head), (i3, rs) = lows[-3], lows[-2], lows[-1]
         if (last_idx - i3) <= 15 and head < ls * 0.995 and head < rs * 0.995:
@@ -160,14 +156,13 @@ def detect_head_and_shoulders(
 def detect_triangle_convergence(
     df: pd.DataFrame, highs: list[tuple[int, float]], lows: list[tuple[int, float]]
 ) -> list[dict[str, Any]]:
-    """偵測三角收斂 (高點逐步降低、低點逐步墊高，且振幅明顯收縮)"""
+    """偵測三角收斂"""
     signals: list[dict[str, Any]] = []
     if len(highs) < 3 or len(lows) < 3:
         return signals
 
     recent_h = highs[-3:]
     recent_l = lows[-3:]
-    # 檢查高點下降或持平，低點上升或持平，且至少一邊有明顯收斂斜率
     h_vals = [p for _, p in recent_h]
     l_vals = [p for _, p in recent_l]
 
@@ -206,20 +201,18 @@ def detect_triangle_convergence(
 def detect_sr_breakout_and_sweep(
     df: pd.DataFrame, highs: list[tuple[int, float]], lows: list[tuple[int, float]]
 ) -> list[dict[str, Any]]:
-    """偵測關鍵支撐壓力突破，以及假跌破/假突破獵取 (Liquidity Sweep / SFP)"""
+    """偵測整個回溯區間內的關鍵支撐壓力突破，以及假跌破/假突破獵取"""
     signals: list[dict[str, Any]] = []
     last = df.iloc[-1]
     prev = df.iloc[-2]
     last_idx = len(df) - 1
     vol_ratio = float(last["volume"] / last["vol_ma20"]) if pd.notna(last["vol_ma20"]) and last["vol_ma20"] > 0 else 1.0
 
-    # 取過去 10~80 根 K 線內的顯著波段高低點作為關鍵流動性水位
-    ref_highs = [p for i, p in highs if 10]
-    ref_lows = [p for i, p in lows if 10]
+    ref_highs = [p for i, p in highs if (last_idx - i) >= 10]
+    ref_lows = [p for i, p in lows if (last_idx - i) >= 10]
 
     if ref_highs:
         major_res = max(ref_highs[-3:]) if len(ref_highs) >= 3 else max(ref_highs)
-        # 假突破獵取 (Bearish Sweep): 影線刺破前高，但收盤收回前高之下
         if float(last["high"]) > major_res and float(last["close"]) < major_res:
             signals.append({
                 "pattern": "假突破獵取 (Liquidity Sweep)",
@@ -227,7 +220,6 @@ def detect_sr_breakout_and_sweep(
                 "detail": f"最高刺破前高壓力 {major_res:.2f} 至 {last['high']:.2f} 後收回 {last['close']:.2f}（量能 {vol_ratio:.1f}x）",
                 "key_level": round(major_res, 4),
             })
-        # 帶量真突破壓力
         elif float(prev["close"]) <= major_res and float(last["close"]) > major_res and vol_ratio >= 1.4:
             signals.append({
                 "pattern": "關鍵壓力帶量突破",
@@ -238,7 +230,6 @@ def detect_sr_breakout_and_sweep(
 
     if ref_lows:
         major_sup = min(ref_lows[-3:]) if len(ref_lows) >= 3 else min(ref_lows)
-        # 假跌破獵取 (Bullish Sweep): 影線插破前低，但收盤收回前低之上
         if float(last["low"]) < major_sup and float(last["close"]) > major_sup:
             signals.append({
                 "pattern": "假跌破獵取 (Liquidity Sweep)",
@@ -246,7 +237,6 @@ def detect_sr_breakout_and_sweep(
                 "detail": f"最低插破前低支撐 {major_sup:.2f} 至 {last['low']:.2f} 後收回 {last['close']:.2f}（量能 {vol_ratio:.1f}x）",
                 "key_level": round(major_sup, 4),
             })
-        # 帶量真跌破支撐
         elif float(prev["close"]) >= major_sup and float(last["close"]) < major_sup and vol_ratio >= 1.4:
             signals.append({
                 "pattern": "關鍵支撐帶量跌破",
@@ -263,12 +253,11 @@ def verify_with_gemini(
 ) -> dict[str, Any]:
     """呼叫 Gemini API 進行結構複判與雜訊過濾"""
     if not GEMINI_API_KEY:
-        # 若未設定 API Key，直接回傳演算法初篩結果以便本地測試
         return {
             "is_valid": True,
             "confidence": 7,
             "bias": candidates[0]["direction"],
-            "summary": "（未設定 GEMINI_API_KEY，直接顯示演算法初篩結果）" + "；".join(c["detail"] for c in candidates),
+            "summary": "（未設定 GEMINI_API_KEY）" + "；".join(c["detail"] for c in candidates),
         }
 
     recent_candles = df.tail(20)[["dt", "open", "high", "low", "close", "volume", "rsi"]].copy()
@@ -300,27 +289,61 @@ def verify_with_gemini(
     return json.loads(text)
 
 
-def send_telegram_message(text: str) -> None:
-    """透過 Telegram Bot 發送 HTML 格式通知"""
+def render_chart_png(
+    df: pd.DataFrame, symbol: str, timeframe: str, key_levels: list[float]
+) -> bytes:
+    """繪製最近 80 根 K 線圖（UTC+8），並用虛線標記關鍵頸線／支撐壓力位"""
+    plot_df = df.tail(80).copy()
+    plot_df["dt_tw"] = plot_df["dt"] + pd.Timedelta(hours=8)
+    plot_df = plot_df.set_index("dt_tw")[["open", "high", "low", "close", "volume"]]
+    plot_df.columns = ["Open", "High", "Low", "Close", "Volume"]
+
+    mc = mpf.make_marketcolors(up="#26a69a", down="#ef5350", inherit=True)
+    style = mpf.make_mpf_style(base_mpf_style="nightclouds", marketcolors=mc)
+
+    hlines_cfg = None
+    unique_levels = sorted({round(lvl, 4) for lvl in key_levels if lvl > 0})
+    if unique_levels:
+        hlines_cfg = dict(hlines=unique_levels, colors="#ffd54f", linestyle="--", linewidths=1.2)
+
+    buf = io.BytesIO()
+    plot_kwargs: dict[str, Any] = {
+        "type": "candle",
+        "volume": True,
+        "style": style,
+        "title": f"{symbol} ({timeframe}) - UTC+8",
+        "figsize": (11, 6),
+        "savefig": dict(fname=buf, dpi=140, bbox_inches="tight"),
+    }
+    if hlines_cfg:
+        plot_kwargs["hlines"] = hlines_cfg
+
+    mpf.plot(plot_df, **plot_kwargs)
+    buf.seek(0)
+    return buf.read()
+
+
+def send_telegram_photo(image_bytes: bytes, caption: str) -> None:
+    """透過 Telegram Bot 發送 K 線圖與分析說明"""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("[模擬推播] 未設定 Telegram Token/Chat ID，訊息內容如下：\n" + text)
+        print("[模擬推播] 未設定 Telegram Token/Chat ID，訊息內容如下：\n" + caption)
         return
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
     resp = requests.post(
         url,
-        json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True},
-        timeout=15,
+        data={"chat_id": TELEGRAM_CHAT_ID, "caption": caption[:1024], "parse_mode": "HTML"},
+        files={"photo": ("chart.png", image_bytes, "image/png")},
+        timeout=20,
     )
     resp.raise_for_status()
 
 
 def is_recently_closed_for_tf(df: pd.DataFrame, timeframe: str) -> bool:
-    """確保 1h 週期不會在每次 15m 排程時重複推播同一根 K 線"""
+    """避免同一根 K 線重複推播"""
     last_open_utc = df["dt"].iloc[-1].to_pydatetime()
-    tf_minutes = {"15m": 15, "30m": 30, "1h": 60, "4h": 240}.get(timeframe, 15)
+    tf_minutes = {"15m": 15, "30m": 30, "1h": 60, "4h": 240}.get(timeframe, 30)
     last_close_utc = last_open_utc + timedelta(minutes=tf_minutes)
     age_minutes = (datetime.now(timezone.utc) - last_close_utc).total_seconds() / 60
-    # 允許 18 分鐘內的誤差（配合 GitHub Actions cron 可能延遲幾分鐘）
     return age_minutes <= 65
 
 
@@ -363,6 +386,8 @@ def run(ignore_time_window: bool = False) -> None:
                     last_price = float(df["close"].iloc[-1])
                     candle_tw = df["dt"].iloc[-1].astimezone(tz_tw).strftime("%Y-%m-%d %H:%M")
                     patterns_str = "、".join(c["pattern"] for c in candidates)
+                    key_levels = [float(c["key_level"]) for c in candidates if "key_level" in c]
+                    chart_bytes = render_chart_png(df, symbol, tf, key_levels)
                     msg = (
                         f"🔔 <b>AI 盯盤警報｜{symbol} ({tf})</b>\n"
                         f"• <b>偵測結構</b>：{patterns_str}\n"
@@ -370,7 +395,7 @@ def run(ignore_time_window: bool = False) -> None:
                         f"• <b>現價</b>：{last_price:.2f}（收盤時間 {candle_tw} UTC+8）\n"
                         f"• <b>AI 分析</b>：{ai_result.get('summary')}"
                     )
-                    send_telegram_message(msg)
+                    send_telegram_photo(chart_bytes, msg)
                 else:
                     print(f"[AI 過濾] {symbol} {tf} 信心不足 ({ai_result.get('confidence')}/10)")
 
