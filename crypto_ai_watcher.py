@@ -22,7 +22,7 @@ import requests
 
 # ==================== 使用者設定區 ====================
 EXCHANGE_ID = os.getenv("EXCHANGE_ID", "binance")  # 可改為 "bingx" 或 "binance"
-SYMBOLS = os.getenv("SYMBOLS", "BTC/USDT:USDT,ETH/USDT:USDT,SOL/USDT:USDT").split(",")
+SYMBOLS = os.getenv("SYMBOLS", "BTC/USDT:USDT,ETH/USDT:USDT,SOL/USDT:USDT,SUI/USDT:USDT,ZEC/USDT:USDT").split(",")
 TIMEFRAMES = os.getenv("TIMEFRAMES", "15m,1h").split(",")
 CANDLE_LIMIT = 720
 MIN_AI_CONFIDENCE = int(os.getenv("MIN_AI_CONFIDENCE", "7"))
@@ -321,7 +321,7 @@ def is_recently_closed_for_tf(df: pd.DataFrame, timeframe: str) -> bool:
     last_close_utc = last_open_utc + timedelta(minutes=tf_minutes)
     age_minutes = (datetime.now(timezone.utc) - last_close_utc).total_seconds() / 60
     # 允許 18 分鐘內的誤差（配合 GitHub Actions cron 可能延遲幾分鐘）
-    return age_minutes <= 35
+    return age_minutes <= 65
 
 
 def run(ignore_time_window: bool = False) -> None:
