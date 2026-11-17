@@ -1,11 +1,11 @@
 """
-Crypto AI Market Watcher (with Candlestick Chart Image Alert)
+Crypto AI Market Watcher (with BingX-style Candlestick Chart Alert)
 Detects:
   - Double Top / Double Bottom (M頭 / W底)
   - Head & Shoulders / Inverse H&S (頭肩頂 / 頭肩底)
   - Triangle Convergence (三角收斂)
   - Key S/R Breakout & Liquidity Sweep / Fakeout (關鍵支撐壓力突破 / 假跌破假突破)
-Then uses Gemini AI to filter noise and sends a candlestick chart + analysis to Telegram.
+Then uses Gemini AI to filter noise and sends a crisp BingX-style candlestick chart + analysis to Telegram.
 """
 
 import argparse
@@ -47,7 +47,9 @@ def fetch_ohlcv(exchange: ccxt.Exchange, symbol: str, timeframe: str, limit: int
 
 
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    """計算輔助指標：RSI(14) 與 20 週期均量"""
+    """計算輔助指標：EMA20、EMA50、RSI(14) 與 20 週期均量"""
+    df["ema20"] = df["close"].ewm(span=20, adjust=False).mean()
+    df["ema50"] = df["close"].ewm(span=50, adjust=False).mean()
     delta = df["close"].diff()
     gain = delta.clip(lower=0).rolling(14).mean()
     loss = (-delta.clip(upper=0)).rolling(14).mean()
@@ -289,36 +291,143 @@ def verify_with_gemini(
     return json.loads(text)
 
 
+def _fmt_price(val: float) -> str:
+    """依幣種價位自動決定小數位數"""
+    if val >= 1000:
+        return f"{val:,.1f}"
+    if val >= 10:
+        return f"{val:.2f}"
+    if val >= 1:
+        return f"{val:.3f}"
+    return f"{val:.5f}"
+
+
 def render_chart_png(
     df: pd.DataFrame, symbol: str, timeframe: str, key_levels: list[float]
 ) -> bytes:
-    """繪製最近 80 根 K 線圖（UTC+8），並用虛線標記關鍵頸線／支撐壓力位"""
-    plot_df = df.tail(80).copy()
+    """繪製仿 BingX App 風格的高清晰度 K 線圖（右側價位軸、最高/最低點標註、現價與關鍵位標籤）"""
+    if "ema20" not in df.columns:
+        df = add_indicators(df.copy())
+
+    plot_df = df.tail(110).copy().reset_index(drop=True)
     plot_df["dt_tw"] = plot_df["dt"] + pd.Timedelta(hours=8)
-    plot_df = plot_df.set_index("dt_tw")[["open", "high", "low", "close", "volume"]]
-    plot_df.columns = ["Open", "High", "Low", "Close", "Volume"]
+    plot_df_idx = plot_df.set_index("dt_tw")
 
-    mc = mpf.make_marketcolors(up="#26a69a", down="#ef5350", inherit=True)
-    style = mpf.make_mpf_style(base_mpf_style="nightclouds", marketcolors=mc)
+    ohlcv_df = plot_df_idx[["open", "high", "low", "close", "volume"]].copy()
+    ohlcv_df.columns = ["Open", "High", "Low", "Close", "Volume"]
 
-    hlines_cfg = None
-    unique_levels = sorted({round(lvl, 4) for lvl in key_levels if lvl > 0})
-    if unique_levels:
-        hlines_cfg = dict(hlines=unique_levels, colors="#ffd54f", linestyle="--", linewidths=1.2)
+    mc = mpf.make_marketcolors(
+        up="#0ecb81",
+        down="#f6465d",
+        edge="inherit",
+        wick="inherit",
+        volume={"up": "#0ecb81", "down": "#f6465d"},
+    )
+    style = mpf.make_mpf_style(
+        base_mpf_style="nightclouds",
+        marketcolors=mc,
+        facecolor="#0b0e11",
+        figcolor="#0b0e11",
+        gridcolor="#1a1e26",
+        gridstyle="-",
+        y_on_right=True,
+        rc={
+            "axes.edgecolor": "#262b36",
+            "xtick.color": "#848e9c",
+            "ytick.color": "#848e9c",
+            "axes.labelcolor": "#848e9c",
+            "text.color": "#eaecef",
+        },
+    )
+
+    addplots = [
+        mpf.make_addplot(plot_df_idx["ema20"], color="#29b6f6", width=0.9, panel=0),
+        mpf.make_addplot(plot_df_idx["ema50"], color="#ffa726", width=0.9, panel=0),
+    ]
+
+    unique_levels = sorted({round(lvl, 5) for lvl in key_levels if lvl > 0})
+    last_price = float(ohlcv_df["Close"].iloc[-1])
 
     buf = io.BytesIO()
-    plot_kwargs: dict[str, Any] = {
-        "type": "candle",
-        "volume": True,
-        "style": style,
-        "title": f"{symbol} ({timeframe}) - UTC+8",
-        "figsize": (11, 6),
-        "savefig": dict(fname=buf, dpi=140, bbox_inches="tight"),
-    }
-    if hlines_cfg:
-        plot_kwargs["hlines"] = hlines_cfg
+    fig, axes = mpf.plot(
+        ohlcv_df,
+        type="candle",
+        volume=True,
+        panel_ratios=(5, 1.2),
+        addplot=addplots,
+        style=style,
+        title=f"{symbol}  ·  {timeframe}  (UTC+8)",
+        figsize=(12, 6.8),
+        xlim=(-1, len(ohlcv_df) + 12),
+        returnfig=True,
+        tight_layout=True,
+    )
 
-    mpf.plot(plot_df, **plot_kwargs)
+    ax_main = axes[0]
+    n = len(ohlcv_df)
+
+    # 1. 標註最高價與最低價（仿 BingX 白色細指引線）
+    hi_idx = int(plot_df["high"].idxmax())
+    hi_val = float(plot_df["high"].iloc[hi_idx])
+    lo_idx = int(plot_df["low"].idxmin())
+    lo_val = float(plot_df["low"].iloc[lo_idx])
+
+    hi_offset = 6 if hi_idx < n - 12 else -14
+    ax_main.plot([hi_idx, hi_idx + hi_offset], [hi_val, hi_val], color="#eaecef", linewidth=0.9)
+    ax_main.text(
+        hi_idx + hi_offset + (0.6 if hi_offset > 0 else -0.6),
+        hi_val,
+        _fmt_price(hi_val),
+        color="#eaecef",
+        fontsize=9.5,
+        va="center",
+        ha="left" if hi_offset > 0 else "right",
+        fontweight="bold",
+    )
+
+    lo_offset = 6 if lo_idx < n - 12 else -14
+    ax_main.plot([lo_idx, lo_idx + lo_offset], [lo_val, lo_val], color="#eaecef", linewidth=0.9)
+    ax_main.text(
+        lo_idx + lo_offset + (0.6 if lo_offset > 0 else -0.6),
+        lo_val,
+        _fmt_price(lo_val),
+        color="#eaecef",
+        fontsize=9.5,
+        va="center",
+        ha="left" if lo_offset > 0 else "right",
+        fontweight="bold",
+    )
+
+    # 2. 畫出關鍵頸線／支撐壓力虛線與右側外框標籤
+    for lvl in unique_levels:
+        ax_main.axhline(lvl, color="#f0b90b", linestyle="--", linewidth=1.1, alpha=0.9)
+        ax_main.text(
+            n + 1.5,
+            lvl,
+            f" {_fmt_price(lvl)} ",
+            color="#f0b90b",
+            fontsize=9,
+            va="center",
+            ha="left",
+            fontweight="bold",
+            bbox=dict(boxstyle="round,pad=0.22", facecolor="#1e1b10", edgecolor="#f0b90b", linewidth=1),
+        )
+
+    # 3. 畫出現價虛線與右側白色外框標籤
+    ax_main.plot([n - 1, n + 1.2], [last_price, last_price], color="#eaecef", linestyle=":", linewidth=1.0)
+    ax_main.text(
+        n + 1.5,
+        last_price,
+        f" {_fmt_price(last_price)} ",
+        color="#eaecef",
+        fontsize=9.5,
+        va="center",
+        ha="left",
+        fontweight="bold",
+        bbox=dict(boxstyle="round,pad=0.25", facecolor="#1e2329", edgecolor="#eaecef", linewidth=1),
+    )
+
+    fig.savefig(buf, dpi=220, bbox_inches="tight", facecolor="#0b0e11")
     buf.seek(0)
     return buf.read()
 
