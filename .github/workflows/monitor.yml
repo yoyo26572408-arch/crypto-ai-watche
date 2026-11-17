@@ -1,0 +1,37 @@
+name: Crypto AI Market Watcher
+
+on:
+  schedule:
+    # 每 15 分鐘自動執行一次（UTC 時間）
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
+    # 允許在 GitHub 網頁上手動按「Run workflow」立即測試
+
+jobs:
+  watch-market:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 下載專案程式碼
+        uses: actions/checkout@v4
+
+      - name: 設定 Python 環境
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 安裝必要套件
+        run: |
+          pip install --upgrade pip
+          pip install ccxt pandas numpy requests
+
+      - name: 執行 AI 盯盤程式
+        env:
+          EXCHANGE_ID: "BingX" 
+          SYMBOLS: "BTC/USDT:USDT,ETH/USDT:USDT,SOL/USDT:USDT"
+          TIMEFRAMES: "15m,1h"
+          MIN_AI_CONFIDENCE: "7"
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python crypto_ai_watcher.py
