@@ -23,7 +23,7 @@ jobs:
       - name: 安裝必要套件
         run: |
           pip install --upgrade pip
-          pip install ccxt pandas numpy requests
+          pip install ccxt pandas numpy requests mplfinance
 
       - name: 執行 AI 盯盤程式
         env:
