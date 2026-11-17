@@ -1,11 +1,11 @@
 """
-Crypto AI Market Watcher (with BingX-style Candlestick Chart Alert)
+Crypto AI Market Watcher (with BingX-style Chart + Entry / SL / TP Lines)
 Detects:
   - Double Top / Double Bottom (M頭 / W底)
   - Head & Shoulders / Inverse H&S (頭肩頂 / 頭肩底)
   - Triangle Convergence (三角收斂)
   - Key S/R Breakout & Liquidity Sweep / Fakeout (關鍵支撐壓力突破 / 假跌破假突破)
-Then uses Gemini AI to filter noise and sends a crisp BingX-style candlestick chart + analysis to Telegram.
+Then uses Gemini AI to filter noise, compute Entry / SL / TP, and sends a BingX-style chart to Telegram.
 """
 
 import argparse
@@ -47,7 +47,7 @@ def fetch_ohlcv(exchange: ccxt.Exchange, symbol: str, timeframe: str, limit: int
 
 
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    """計算輔助指標：EMA20、EMA50、RSI(14) 與 20 週期均量"""
+    """計算輔助指標：EMA20、EMA50、RSI(14)、ATR(14) 與 20 週期均量"""
     df["ema20"] = df["close"].ewm(span=20, adjust=False).mean()
     df["ema50"] = df["close"].ewm(span=50, adjust=False).mean()
     delta = df["close"].diff()
@@ -55,6 +55,12 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     loss = (-delta.clip(upper=0)).rolling(14).mean()
     rs = gain / loss.replace(0, np.nan)
     df["rsi"] = 100 - (100 / (1 + rs))
+    tr = pd.concat([
+        df["high"] - df["low"],
+        (df["high"] - df["close"].shift()).abs(),
+        (df["low"] - df["close"].shift()).abs(),
+    ], axis=1).max(axis=1)
+    df["atr"] = tr.rolling(14).mean()
     df["vol_ma20"] = df["volume"].rolling(20).mean()
     return df
 
@@ -93,7 +99,7 @@ def detect_double_top_bottom(
                         "pattern": "M頭 (Double Top)",
                         "direction": "偏空",
                         "detail": f"雙頂高點 {p1:.2f} / {p2:.2f}，頸線 {neckline:.2f}（{status}）",
-                        "key_level": round(neckline, 4),
+                        "key_level": round(neckline, 5),
                     })
 
     if len(lows) >= 2:
@@ -108,7 +114,7 @@ def detect_double_top_bottom(
                         "pattern": "W底 (Double Bottom)",
                         "direction": "偏多",
                         "detail": f"雙底低點 {p1:.2f} / {p2:.2f}，頸線 {neckline:.2f}（{status}）",
-                        "key_level": round(neckline, 4),
+                        "key_level": round(neckline, 5),
                     })
     return signals
 
@@ -134,7 +140,7 @@ def detect_head_and_shoulders(
                         "pattern": "頭肩頂 (Head & Shoulders)",
                         "direction": "偏空",
                         "detail": f"左肩 {ls:.2f} / 頭部 {head:.2f} / 右肩 {rs:.2f}，頸線約 {neckline:.2f}",
-                        "key_level": round(neckline, 4),
+                        "key_level": round(neckline, 5),
                     })
 
     if len(lows) >= 3:
@@ -150,7 +156,7 @@ def detect_head_and_shoulders(
                         "pattern": "頭肩底 (Inverse H&S)",
                         "direction": "偏多",
                         "detail": f"左肩 {ls:.2f} / 頭部 {head:.2f} / 右肩 {rs:.2f}，頸線約 {neckline:.2f}",
-                        "key_level": round(neckline, 4),
+                        "key_level": round(neckline, 5),
                     })
     return signals
 
@@ -195,7 +201,7 @@ def detect_triangle_convergence(
                 "pattern": tri_type,
                 "direction": "待方向確認" if "末端" in breakout_note else ("偏多" if "上" in breakout_note else "偏空"),
                 "detail": f"上緣 {h_vals[-1]:.2f} / 下緣 {l_vals[-1]:.2f}（{breakout_note}）",
-                "key_level": round(h_vals[-1] if "上" in breakout_note else l_vals[-1], 4),
+                "key_level": round(h_vals[-1] if "上" in breakout_note else l_vals[-1], 5),
             })
     return signals
 
@@ -220,14 +226,14 @@ def detect_sr_breakout_and_sweep(
                 "pattern": "假突破獵取 (Liquidity Sweep)",
                 "direction": "偏空",
                 "detail": f"最高刺破前高壓力 {major_res:.2f} 至 {last['high']:.2f} 後收回 {last['close']:.2f}（量能 {vol_ratio:.1f}x）",
-                "key_level": round(major_res, 4),
+                "key_level": round(major_res, 5),
             })
         elif float(prev["close"]) <= major_res and float(last["close"]) > major_res and vol_ratio >= 1.4:
             signals.append({
                 "pattern": "關鍵壓力帶量突破",
                 "direction": "偏多",
                 "detail": f"放量 ({vol_ratio:.1f}x) 站上關鍵壓力 {major_res:.2f}，收在 {last['close']:.2f}",
-                "key_level": round(major_res, 4),
+                "key_level": round(major_res, 5),
             })
 
     if ref_lows:
@@ -237,47 +243,72 @@ def detect_sr_breakout_and_sweep(
                 "pattern": "假跌破獵取 (Liquidity Sweep)",
                 "direction": "偏多",
                 "detail": f"最低插破前低支撐 {major_sup:.2f} 至 {last['low']:.2f} 後收回 {last['close']:.2f}（量能 {vol_ratio:.1f}x）",
-                "key_level": round(major_sup, 4),
+                "key_level": round(major_sup, 5),
             })
         elif float(prev["close"]) >= major_sup and float(last["close"]) < major_sup and vol_ratio >= 1.4:
             signals.append({
                 "pattern": "關鍵支撐帶量跌破",
                 "direction": "偏空",
                 "detail": f"放量 ({vol_ratio:.1f}x) 跌破關鍵支撐 {major_sup:.2f}，收在 {last['close']:.2f}",
-                "key_level": round(major_sup, 4),
+                "key_level": round(major_sup, 5),
             })
 
     return signals
 
 
+def _fallback_trade_plan(df: pd.DataFrame, candidates: list[dict[str, Any]]) -> dict[str, float]:
+    """當未提供 AI 價位時的結構化保底入場／止損／止盈計算"""
+    entry = float(df["close"].iloc[-1])
+    atr = float(df["atr"].iloc[-1]) if "atr" in df.columns and pd.notna(df["atr"].iloc[-1]) else entry * 0.012
+    bias = candidates[0].get("direction", "偏多")
+    if bias == "偏空":
+        sl = float(df["high"].tail(12).max()) + atr * 0.3
+        risk = max(sl - entry, atr)
+        sl = entry + risk
+        tp = entry - risk * 2.0
+    else:
+        sl = float(df["low"].tail(12).min()) - atr * 0.3
+        risk = max(entry - sl, atr)
+        sl = entry - risk
+        tp = entry + risk * 2.0
+    return {"entry": entry, "stop_loss": sl, "take_profit": tp}
+
+
 def verify_with_gemini(
     symbol: str, timeframe: str, df: pd.DataFrame, candidates: list[dict[str, Any]]
 ) -> dict[str, Any]:
-    """呼叫 Gemini API 進行結構複判與雜訊過濾"""
+    """呼叫 Gemini API 進行結構複判，並輸出建議入場、止損與止盈價位"""
+    fallback = _fallback_trade_plan(df, candidates)
     if not GEMINI_API_KEY:
         return {
             "is_valid": True,
             "confidence": 7,
             "bias": candidates[0]["direction"],
+            "entry": fallback["entry"],
+            "stop_loss": fallback["stop_loss"],
+            "take_profit": fallback["take_profit"],
             "summary": "（未設定 GEMINI_API_KEY）" + "；".join(c["detail"] for c in candidates),
         }
 
-    recent_candles = df.tail(20)[["dt", "open", "high", "low", "close", "volume", "rsi"]].copy()
+    recent_candles = df.tail(25)[["dt", "open", "high", "low", "close", "volume", "rsi"]].copy()
     recent_candles["dt"] = recent_candles["dt"].dt.strftime("%m-%d %H:%M")
-    candles_text = recent_candles.round(2).to_string(index=False)
+    candles_text = recent_candles.round(4).to_string(index=False)
 
     prompt = f"""你是專業的加密貨幣技術分析師。演算法在 {symbol} ({timeframe} 週期) 偵測到以下候選型態/結構：
 {json.dumps(candidates, ensure_ascii=False, indent=2)}
 
-以下為最近 20 根已收盤 K 線數據 (UTC 時間)：
+以下為最近 25 根已收盤 K 線數據 (UTC 時間)：
 {candles_text}
 
-請嚴格評估這些型態或流動性結構是否具備交易參考價值（過濾掉震盪雜訊或缺乏量價配合的假訊號），並只回傳純 JSON（不要加 markdown 標記），格式如下：
+請嚴格評估這些型態或流動性結構是否具備交易參考價值（過濾掉震盪雜訊），並根據結構高低點與頸線給出具體的入場點、止損點與止盈點（風險報酬比建議至少 1:2），只回傳純 JSON（不要加 markdown 標記），格式如下：
 {{
   "is_valid": true 或 false,
   "confidence": 1 到 10 的整數,
   "bias": "偏多" 或 "偏空" 或 "待確認",
-  "summary": "用 2-3 句繁體中文說明結構重點、關鍵觀察價位與失效位置（止損參考）"
+  "entry": 數字（建議入場或回測接單價位）,
+  "stop_loss": 數字（結構失效止損價位）,
+  "take_profit": 數字（目標止盈價位）,
+  "summary": "用 2 句繁體中文說明結構重點與操作邏輯"
 }}"""
 
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
@@ -288,7 +319,11 @@ def verify_with_gemini(
     resp = requests.post(url, json=payload, timeout=30)
     resp.raise_for_status()
     text = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
-    return json.loads(text)
+    result = json.loads(text)
+    for k in ("entry", "stop_loss", "take_profit"):
+        if not result.get(k):
+            result[k] = fallback[k]
+    return result
 
 
 def _fmt_price(val: float) -> str:
@@ -303,9 +338,15 @@ def _fmt_price(val: float) -> str:
 
 
 def render_chart_png(
-    df: pd.DataFrame, symbol: str, timeframe: str, key_levels: list[float]
+    df: pd.DataFrame,
+    symbol: str,
+    timeframe: str,
+    key_levels: list[float],
+    entry: float | None = None,
+    stop_loss: float | None = None,
+    take_profit: float | None = None,
 ) -> bytes:
-    """繪製仿 BingX App 風格的高清晰度 K 線圖（右側價位軸、最高/最低點標註、現價與關鍵位標籤）"""
+    """繪製仿 BingX App 風格的高清晰度 K 線圖（含入場／止盈／止損線與右側標籤框）"""
     if "ema20" not in df.columns:
         df = add_indicators(df.copy())
 
@@ -348,6 +389,14 @@ def render_chart_png(
     unique_levels = sorted({round(lvl, 5) for lvl in key_levels if lvl > 0})
     last_price = float(ohlcv_df["Close"].iloc[-1])
 
+    # 確保 Y 軸範圍涵蓋 TP 與 SL，不會被切掉
+    all_y = [float(plot_df["low"].min()), float(plot_df["high"].max())]
+    for v in (entry, stop_loss, take_profit, *unique_levels):
+        if v is not None and v > 0:
+            all_y.append(float(v))
+    y_min, y_max = min(all_y), max(all_y)
+    y_pad = (y_max - y_min) * 0.08 if y_max > y_min else y_max * 0.02
+
     buf = io.BytesIO()
     fig, axes = mpf.plot(
         ohlcv_df,
@@ -357,8 +406,9 @@ def render_chart_png(
         addplot=addplots,
         style=style,
         title=f"{symbol}  ·  {timeframe}  (UTC+8)",
-        figsize=(12, 6.8),
-        xlim=(-1, len(ohlcv_df) + 12),
+        figsize=(12.5, 7),
+        xlim=(-1, len(ohlcv_df) + 18),
+        ylim=(y_min - y_pad, y_max + y_pad),
         returnfig=True,
         tight_layout=True,
     )
@@ -379,7 +429,7 @@ def render_chart_png(
         hi_val,
         _fmt_price(hi_val),
         color="#eaecef",
-        fontsize=9.5,
+        fontsize=9,
         va="center",
         ha="left" if hi_offset > 0 else "right",
         fontweight="bold",
@@ -392,40 +442,65 @@ def render_chart_png(
         lo_val,
         _fmt_price(lo_val),
         color="#eaecef",
-        fontsize=9.5,
+        fontsize=9,
         va="center",
         ha="left" if lo_offset > 0 else "right",
         fontweight="bold",
     )
 
-    # 2. 畫出關鍵頸線／支撐壓力虛線與右側外框標籤
+    # 2. 關鍵結構價位（黃色虛線，標籤放左側避免與右側 TP/SL 重疊）
     for lvl in unique_levels:
-        ax_main.axhline(lvl, color="#f0b90b", linestyle="--", linewidth=1.1, alpha=0.9)
+        ax_main.axhline(lvl, color="#f0b90b", linestyle="--", linewidth=1.0, alpha=0.85)
         ax_main.text(
-            n + 1.5,
+            0.5,
             lvl,
-            f" {_fmt_price(lvl)} ",
+            f" Key {_fmt_price(lvl)} ",
             color="#f0b90b",
+            fontsize=8.5,
+            va="bottom",
+            ha="left",
+            fontweight="bold",
+            bbox=dict(boxstyle="round,pad=0.18", facecolor="#1e1b10", edgecolor="#f0b90b", linewidth=0.9),
+        )
+
+    # 3. 畫出 止盈 (綠) / 止損 (紅) / 入場 (白) 線與右側標籤框
+    right_x = n + 1.5
+    lines_to_draw: list[tuple[str, float, str, str, str]] = []
+    if take_profit:
+        lines_to_draw.append(("TP", float(take_profit), "#0ecb81", "#0c261d", "--"))
+    if entry:
+        lines_to_draw.append(("Entry", float(entry), "#eaecef", "#1e2329", "-."))
+    if stop_loss:
+        lines_to_draw.append(("SL", float(stop_loss), "#f6465d", "#2c1117", "--"))
+
+    for label, price_val, edge_col, bg_col, ls in lines_to_draw:
+        ax_main.axhline(price_val, color=edge_col, linestyle=ls, linewidth=1.2, alpha=0.95)
+        ax_main.text(
+            right_x,
+            price_val,
+            f" {label} {_fmt_price(price_val)} ",
+            color=edge_col,
             fontsize=9,
             va="center",
             ha="left",
             fontweight="bold",
-            bbox=dict(boxstyle="round,pad=0.22", facecolor="#1e1b10", edgecolor="#f0b90b", linewidth=1),
+            bbox=dict(boxstyle="round,pad=0.22", facecolor=bg_col, edgecolor=edge_col, linewidth=1),
         )
 
-    # 3. 畫出現價虛線與右側白色外框標籤
-    ax_main.plot([n - 1, n + 1.2], [last_price, last_price], color="#eaecef", linestyle=":", linewidth=1.0)
-    ax_main.text(
-        n + 1.5,
-        last_price,
-        f" {_fmt_price(last_price)} ",
-        color="#eaecef",
-        fontsize=9.5,
-        va="center",
-        ha="left",
-        fontweight="bold",
-        bbox=dict(boxstyle="round,pad=0.25", facecolor="#1e2329", edgecolor="#eaecef", linewidth=1),
-    )
+    # 若沒有傳入 entry，至少標示現價
+    if not entry:
+        ax_main.plot([n - 1, n + 1.2], [last_price, last_price], color="#eaecef", linestyle=":", linewidth=1.0)
+        ax_main.text(
+            right_x,
+            last_price,
+            f" {_fmt_price(last_price)} ",
+            color="#eaecef",
+            fontsize=9,
+            va="center",
+            ha="left",
+            fontweight="bold",
+            bbox=dict(boxstyle="round,pad=0.22", facecolor="#1e2329", edgecolor="#eaecef", linewidth=1),
+        )
 
     fig.savefig(buf, dpi=220, bbox_inches="tight", facecolor="#0b0e11")
     buf.seek(0)
@@ -496,12 +571,23 @@ def run(ignore_time_window: bool = False) -> None:
                     candle_tw = df["dt"].iloc[-1].astimezone(tz_tw).strftime("%Y-%m-%d %H:%M")
                     patterns_str = "、".join(c["pattern"] for c in candidates)
                     key_levels = [float(c["key_level"]) for c in candidates if "key_level" in c]
-                    chart_bytes = render_chart_png(df, symbol, tf, key_levels)
+
+                    entry_p = float(ai_result["entry"])
+                    sl_p = float(ai_result["stop_loss"])
+                    tp_p = float(ai_result["take_profit"])
+                    risk = abs(entry_p - sl_p)
+                    rr = abs(tp_p - entry_p) / risk if risk > 0 else 0
+
+                    chart_bytes = render_chart_png(
+                        df, symbol, tf, key_levels,
+                        entry=entry_p, stop_loss=sl_p, take_profit=tp_p,
+                    )
                     msg = (
                         f"🔔 <b>AI 盯盤警報｜{symbol} ({tf})</b>\n"
                         f"• <b>偵測結構</b>：{patterns_str}\n"
                         f"• <b>AI 傾向</b>：{ai_result.get('bias')}（信心 {ai_result.get('confidence')}/10）\n"
-                        f"• <b>現價</b>：{last_price:.2f}（收盤時間 {candle_tw} UTC+8）\n"
+                        f"• <b>現價</b>：{_fmt_price(last_price)}（{candle_tw} UTC+8）\n"
+                        f"• <b>參考規劃</b>：入場 <code>{_fmt_price(entry_p)}</code> ｜ 止損 <code>{_fmt_price(sl_p)}</code> ｜ 止盈 <code>{_fmt_price(tp_p)}</code>（R:R ≈ 1:{rr:.1f}）\n"
                         f"• <b>AI 分析</b>：{ai_result.get('summary')}"
                     )
                     send_telegram_photo(chart_bytes, msg)
