@@ -28,7 +28,7 @@ jobs:
       - name: 執行 AI 盯盤程式
         env:
           EXCHANGE_ID: "bingx" 
-          SYMBOLS: "BTC/USDT:USDT,ETH/USDT:USDT,SOL/USDT:USDT"
+          SYMBOLS: "BTC/USDT:USDT,ETH/USDT:USDT,SOL/USDT:USDT,SUI/USDT:USDT,ZEC/USDT:USDT"
           TIMEFRAMES: "30m,1h,4h"
           MIN_AI_CONFIDENCE: "6"
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
