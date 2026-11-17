@@ -317,11 +317,11 @@ def send_telegram_message(text: str) -> None:
 def is_recently_closed_for_tf(df: pd.DataFrame, timeframe: str) -> bool:
     """確保 1h 週期不會在每次 15m 排程時重複推播同一根 K 線"""
     last_open_utc = df["dt"].iloc[-1].to_pydatetime()
-    tf_minutes = {"15m": 15, "1h": 60, "4h": 240}.get(timeframe, 15)
+    tf_minutes = {"15m": 15, "30m": 30, "1h": 60, "4h": 240}.get(timeframe, 15)
     last_close_utc = last_open_utc + timedelta(minutes=tf_minutes)
     age_minutes = (datetime.now(timezone.utc) - last_close_utc).total_seconds() / 60
     # 允許 18 分鐘內的誤差（配合 GitHub Actions cron 可能延遲幾分鐘）
-    return age_minutes <= 18
+    return age_minutes <= 35
 
 
 def run(ignore_time_window: bool = False) -> None:
