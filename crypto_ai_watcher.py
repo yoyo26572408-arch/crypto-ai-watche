@@ -1,11 +1,10 @@
 """
-Crypto AI Vision Market Watcher (Gemini 2.5 Flash 看圖盯盤 + 抗限流自動重試與備援版)
+Crypto AI Vision Market Watcher (Gemini 2.5 Flash 看圖盯盤 + 趨勢折線/箭頭繪製 + 抗限流版)
 流程：
   1. 每 30 分鐘由 cron-job.org 準時觸發，抓取 30m / 1h / 4h / 1d 剛收盤的 K 線
   2. 內建 BingX 限流 (100410) 自動重試 3 次＋Gate 備援，確保不漏抓任何幣種
-  3. 直接繪製高清晰度 BingX 風格 K 線圖（含均線與高低點）
-  4. 將 K 線圖傳給 Gemini Vision 直接「看圖辨識」三角收斂、旗形壓縮、M頭W底、頭肩、突破與假跌破
-  5. 若有明確型態，Gemini 直接給出入場 / 止損 / 止盈，畫上三條線後推播至 Telegram
+  3. 直接繪製高清晰度 BingX 風格 K 線圖並交給 Gemini Vision 看圖辨識
+  4. 若有明確型態，Gemini 直接標出型態折線座標、入場 / 止損 / 止盈與目標箭頭，畫在圖上推播至 Telegram
 """
 
 import argparse
@@ -97,6 +96,19 @@ def _fmt_price(val: float) -> str:
     return f"{val:.5f}"
 
 
+def _extract_chart_pivots(plot_df: pd.DataFrame, window: int = 3) -> list[dict[str, Any]]:
+    """擷取最近 85 根 K 線內的轉折高低點索引與價位，供 AI 精準畫出趨勢折線"""
+    pivots: list[dict[str, Any]] = []
+    for i in range(window, len(plot_df) - window):
+        h_slice = plot_df["high"].iloc[i - window : i + window + 1]
+        l_slice = plot_df["low"].iloc[i - window : i + window + 1]
+        if plot_df["high"].iloc[i] == h_slice.max():
+            pivots.append({"bar": int(i), "type": "high", "price": round(float(plot_df["high"].iloc[i]), 5)})
+        if plot_df["low"].iloc[i] == l_slice.min():
+            pivots.append({"bar": int(i), "type": "low", "price": round(float(plot_df["low"].iloc[i]), 5)})
+    return pivots[-16:]
+
+
 def render_chart_png(
     df: pd.DataFrame,
     symbol: str,
@@ -104,8 +116,9 @@ def render_chart_png(
     entry: float | None = None,
     stop_loss: float | None = None,
     take_profit: float | None = None,
+    trend_lines: list[list[list[float]]] | None = None,
 ) -> bytes:
-    """繪製仿 BingX App 風格的高清晰度 K 線圖（支援純看圖模式與加上入場/止損/止盈線）"""
+    """繪製仿 BingX / TradingView 風格 K 線圖（含趨勢折線、目標預測箭頭與入場/止損/止盈線）"""
     if "ema20" not in df.columns:
         df = add_indicators(df.copy())
 
@@ -172,6 +185,36 @@ def render_chart_png(
     ax_main = axes[0]
     n = len(ohlcv_df)
 
+    # 1. 畫出型態趨勢折線（如 M 頭、W 底、三角收斂上下緣）
+    if trend_lines:
+        for line in trend_lines:
+            if not isinstance(line, list) or len(line) < 2:
+                continue
+            xs = []
+            ys = []
+            for pt in line:
+                if isinstance(pt, (list, tuple)) and len(pt) == 2:
+                    bx = max(0.0, min(float(n - 1), float(pt[0])))
+                    py = float(pt[1])
+                    if py > 0:
+                        xs.append(bx)
+                        ys.append(py)
+            if len(xs) >= 2:
+                ax_main.plot(xs, ys, color="#b2b5be", linewidth=2.0, alpha=0.9, zorder=5)
+
+    # 2. 畫出從現價/入場指向止盈目標的預測趨勢箭頭
+    if take_profit and take_profit > 0:
+        start_y = float(entry) if entry and entry > 0 else last_price
+        arrow_color = "#0ecb81" if float(take_profit) >= start_y else "#f6465d"
+        ax_main.annotate(
+            "",
+            xy=(n + 7, float(take_profit)),
+            xytext=(n - 1, start_y),
+            arrowprops=dict(arrowstyle="->,head_width=0.45,head_length=0.6", color=arrow_color, lw=2.0, alpha=0.95),
+            zorder=6,
+        )
+
+    # 3. 標註最高價與最低價
     hi_idx = int(plot_df["high"].idxmax())
     hi_val = float(plot_df["high"].iloc[hi_idx])
     lo_idx = int(plot_df["low"].idxmin())
@@ -203,6 +246,7 @@ def render_chart_png(
         fontweight="bold",
     )
 
+    # 4. 畫出 止盈 / 入場 / 止損 水平虛線與右側價格標籤框
     right_x = n + 1.5
     lines_to_draw: list[tuple[str, float, str, str, str]] = []
     if take_profit:
@@ -248,17 +292,21 @@ def render_chart_png(
 def analyze_chart_with_gemini_vision(
     symbol: str, timeframe: str, df: pd.DataFrame, raw_chart_bytes: bytes
 ) -> dict[str, Any]:
-    """直接讓 Gemini Vision 看 K 線圖，辨識三角收斂、旗形、M頭/W底、頭肩、突破與假跌破"""
+    """直接讓 Gemini Vision 看 K 線圖，辨識型態並回傳趨勢線座標點"""
     if not GEMINI_API_KEY:
         raise RuntimeError("請設定 GEMINI_API_KEY 才能使用 AI 看圖盯盤")
 
-    last_price = float(df["close"].iloc[-1])
-    recent_high = float(df["high"].tail(20).max())
-    recent_low = float(df["low"].tail(20).min())
+    plot_df = df.tail(85).copy().reset_index(drop=True)
+    pivots = _extract_chart_pivots(plot_df, window=3)
+    last_price = float(plot_df["close"].iloc[-1])
+    recent_high = float(plot_df["high"].tail(20).max())
+    recent_low = float(plot_df["low"].tail(20).min())
     img_b64 = base64.b64encode(raw_chart_bytes).decode("utf-8")
 
-    prompt = f"""你是專業的加密貨幣技術分析師。請直接觀察這張 {symbol} ({timeframe} 週期) 的最新 K 線圖。
+    prompt = f"""你是專業的加密貨幣技術分析師。請直接觀察這張 {symbol} ({timeframe} 週期、共 85 根 K 線，最左為 bar 0、最右最新收盤為 bar 84) 的最新 K 線圖。
 目前最新收盤價為 {_fmt_price(last_price)}，近 20 根最高 {_fmt_price(recent_high)}、最低 {_fmt_price(recent_low)}。
+圖上主要波段轉折點參考（bar 編號與價格）：
+{json.dumps(pivots, ensure_ascii=False)}
 
 請檢查圖中「最右側（最新一段走勢）」是否正在形成或剛觸發以下任何清晰型態或結構：
 1. 三角收斂 / 末端緊密壓縮收斂（包含對稱三角、上升/下降三角、旗形收斂，哪怕只有 10-15 根 K 線的小收斂也算）
@@ -266,15 +314,16 @@ def analyze_chart_with_gemini_vision(
 3. 關鍵支撐壓力帶量突破，或假跌破 / 假突破獵取 (Liquidity Sweep)
 
 如果沒有明確型態（只是無序震盪），請將 has_pattern 設為 false。
-如果有明確型態，請給出具體的入場點、止損點與止盈點（風險報酬比建議至少 1:1.8），只回傳純 JSON：
+如果有明確型態，請給出具體的入場點、止損點、止盈點，並從轉折點（或 bar 84）挑出座標組合成 `trend_lines` 以便在圖上畫出結構線（例如 M 頭就回傳 1 條 4-5 個點的折線 `[[[b1,p1],[b2,p2],[b3,p3],[b4,p4]]]`；三角收斂就回傳 2 條線，分別是上緣與下緣 `[[[b1,h1],[84,h2]], [[b3,l1],[84,l2]]]`）。只回傳純 JSON：
 {{
   "has_pattern": true 或 false,
-  "pattern_name": "型態名稱（例如：末端三角收斂、W底突破、假跌破反彈）",
+  "pattern_name": "型態名稱",
   "confidence": 1 到 10 的整數,
   "bias": "偏多" 或 "偏空" 或 "待突破方向確認",
-  "entry": 數字（建議入場或突破掛單價位）,
-  "stop_loss": 數字（結構失效止損價位）,
-  "take_profit": 數字（目標止盈價位）,
+  "entry": 數字,
+  "stop_loss": 數字,
+  "take_profit": 數字,
+  "trend_lines": [[[bar, price], [bar, price], ...]],
   "summary": "用 2 句繁體中文說明你從圖上看到什麼結構，以及進出場觀察重點"
 }}"""
 
@@ -357,6 +406,7 @@ def run(ignore_time_window: bool = False) -> None:
                     marked_chart = render_chart_png(
                         df, symbol, tf,
                         entry=entry_p, stop_loss=sl_p, take_profit=tp_p,
+                        trend_lines=ai_result.get("trend_lines"),
                     )
                     msg = (
                         f"🔔 <b>AI 看圖警報｜{symbol} ({tf})</b>\n"
