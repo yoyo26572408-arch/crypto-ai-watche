@@ -1,10 +1,11 @@
 """
-Crypto AI Vision Market Watcher (Gemini 2.5 Flash 看圖盯盤版)
+Crypto AI Vision Market Watcher (Gemini 2.5 Flash 看圖盯盤 + 抗限流自動重試與備援版)
 流程：
   1. 每 30 分鐘由 cron-job.org 準時觸發，抓取 30m / 1h / 4h / 1d 剛收盤的 K 線
-  2. 直接繪製高清晰度 BingX 風格 K 線圖（含均線與高低點）
-  3. 將 K 線圖傳給 Gemini Vision 直接「看圖辨識」三角收斂、旗形壓縮、M頭W底、頭肩、突破與假跌破
-  4. 若有明確型態，Gemini 直接給出入場 / 止損 / 止盈，畫上三條線後推播至 Telegram
+  2. 內建 BingX 限流 (100410) 自動重試 3 次＋Gate 備援，確保不漏抓任何幣種
+  3. 直接繪製高清晰度 BingX 風格 K 線圖（含均線與高低點）
+  4. 將 K 線圖傳給 Gemini Vision 直接「看圖辨識」三角收斂、旗形壓縮、M頭W底、頭肩、突破與假跌破
+  5. 若有明確型態，Gemini 直接給出入場 / 止損 / 止盈，畫上三條線後推播至 Telegram
 """
 
 import argparse
@@ -12,6 +13,7 @@ import base64
 import io
 import json
 import os
+import time
 from datetime import datetime, timezone, timedelta
 from typing import Any
 
@@ -24,6 +26,7 @@ import requests
 
 # ==================== 使用者設定區 ====================
 EXCHANGE_ID = os.getenv("EXCHANGE_ID", "bingx")
+FALLBACK_EXCHANGE_ID = os.getenv("FALLBACK_EXCHANGE_ID", "gate")
 SYMBOLS = os.getenv("SYMBOLS", "BTC/USDT:USDT,ETH/USDT:USDT,SOL/USDT:USDT,SUI/USDT:USDT,ZEC/USDT:USDT").split(",")
 TIMEFRAMES = os.getenv("TIMEFRAMES", "30m,1h,4h,1d").split(",")
 CANDLE_LIMIT = 200
@@ -36,14 +39,38 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 # ======================================================
 
 
-def fetch_ohlcv(exchange: ccxt.Exchange, symbol: str, timeframe: str, limit: int = 200) -> pd.DataFrame:
-    """抓取 K 線資料並排除尚未收盤的最後一根 K 線"""
-    ohlcv = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
-    df = pd.DataFrame(ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"])
-    df["dt"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
-    if len(df) > 2:
-        df = df.iloc[:-1].reset_index(drop=True)
-    return df
+def fetch_ohlcv(
+    exchange: ccxt.Exchange,
+    symbol: str,
+    timeframe: str,
+    limit: int = 200,
+    fallback_exchange: ccxt.Exchange | None = None,
+) -> pd.DataFrame:
+    """抓取 K 線資料，遇限流自動重試 3 次，仍失敗則自動切換備援交易所"""
+    last_err: Exception | None = None
+    for attempt in range(1, 4):
+        try:
+            ohlcv = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+            df = pd.DataFrame(ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"])
+            df["dt"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
+            if len(df) > 2:
+                df = df.iloc[:-1].reset_index(drop=True)
+            return df
+        except Exception as exc:
+            last_err = exc
+            print(f"[重試 {attempt}/3] {exchange.id} 抓取 {symbol} {timeframe} 失敗: {exc}")
+            time.sleep(2 * attempt)
+
+    if fallback_exchange is not None:
+        print(f"[切換備援] 改用 {fallback_exchange.id} 抓取 {symbol} {timeframe}")
+        ohlcv = fallback_exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+        df = pd.DataFrame(ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"])
+        df["dt"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
+        if len(df) > 2:
+            df = df.iloc[:-1].reset_index(drop=True)
+        return df
+
+    raise RuntimeError(f"無法取得 {symbol} {timeframe} 資料: {last_err}")
 
 
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
@@ -145,7 +172,6 @@ def render_chart_png(
     ax_main = axes[0]
     n = len(ohlcv_df)
 
-    # 標註最高價與最低價
     hi_idx = int(plot_df["high"].idxmax())
     hi_val = float(plot_df["high"].iloc[hi_idx])
     lo_idx = int(plot_df["low"].idxmin())
@@ -295,6 +321,8 @@ def is_recently_closed_for_tf(df: pd.DataFrame, timeframe: str) -> bool:
 def run(ignore_time_window: bool = False) -> None:
     exchange_cls = getattr(ccxt, EXCHANGE_ID)
     exchange = exchange_cls({"enableRateLimit": True})
+    fallback_cls = getattr(ccxt, FALLBACK_EXCHANGE_ID, None)
+    fallback_exchange = fallback_cls({"enableRateLimit": True}) if fallback_cls else None
     tz_tw = timezone(timedelta(hours=8))
 
     for raw_symbol in SYMBOLS:
@@ -306,7 +334,8 @@ def run(ignore_time_window: bool = False) -> None:
             if not tf:
                 continue
             try:
-                df = fetch_ohlcv(exchange, symbol, tf, limit=CANDLE_LIMIT)
+                time.sleep(0.4)
+                df = fetch_ohlcv(exchange, symbol, tf, limit=CANDLE_LIMIT, fallback_exchange=fallback_exchange)
                 if not ignore_time_window and not is_recently_closed_for_tf(df, tf):
                     print(f"[跳過] {symbol} {tf} 非剛收盤的 K 線，避免重複通知")
                     continue
