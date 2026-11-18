@@ -31,5 +31,6 @@ jobs:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python crypto_ai_watcher.py
+        run: python -c "import ccxt; from crypto_ai_watcher import fetch_ohlcv, render_chart_png, send_telegram_photo; df=fetch_ohlcv(ccxt.bingx(),'ETH/USDT:USDT','30m',120); p=float(df['close'].iloc[-1]); send_telegram_photo(render_chart_png(df,'ETH/USDT:USDT','30m',entry=p,stop_loss=p*0.985,take_profit=p*1.03), '🔔 <b>AI 看圖警報｜ETH/USDT:USDT (30m)</b>\n• <b>型態結構</b>：末端三角收斂（示範測試）\n• <b>AI 傾向</b>：偏多（信心 8/10）\n• <b>參考規劃</b>：入場 <code>'+str(round(p,2))+'</code>｜止損 <code>'+str(round(p*0.985,2))+'</code>｜止盈 <code>'+str(round(p*1.03,2))+'</code>')"
+
 
