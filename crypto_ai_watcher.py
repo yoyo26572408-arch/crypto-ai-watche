@@ -3,7 +3,7 @@ Crypto AI Market Watcher (with BingX-style Chart + Entry / SL / TP Lines)
 Detects:
   - Double Top / Double Bottom (M頭 / W底)
   - Head & Shoulders / Inverse H&S (頭肩頂 / 頭肩底)
-  - Triangle Convergence (三角收斂)
+  - Triangle Convergence via Trendline Regression (三角收斂，允許小幅插針誤差)
   - Key S/R Breakout & Liquidity Sweep / Fakeout (關鍵支撐壓力突破 / 假跌破假突破)
 Then uses Gemini AI to filter noise, compute Entry / SL / TP, and sends a BingX-style chart to Telegram.
 """
@@ -24,10 +24,10 @@ import requests
 
 # ==================== 使用者設定區 ====================
 EXCHANGE_ID = os.getenv("EXCHANGE_ID", "bingx")
-SYMBOLS = os.getenv("SYMBOLS", "BTC/USDT:USDT,ETH/USDT:USDT,SOL/USDT:USDT").split(",")
-TIMEFRAMES = os.getenv("TIMEFRAMES", "1h,4h").split(",")
+SYMBOLS = os.getenv("SYMBOLS", "BTC/USDT:USDT,ETH/USDT:USDT,SOL/USDT:USDT,SUI/USDT:USDT,ZEC/USDT:USDT").split(",")
+TIMEFRAMES = os.getenv("TIMEFRAMES", "30m,1h,4h").split(",")
 CANDLE_LIMIT = 720
-MIN_AI_CONFIDENCE = int(os.getenv("MIN_AI_CONFIDENCE", "7"))
+MIN_AI_CONFIDENCE = int(os.getenv("MIN_AI_CONFIDENCE", "6"))
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
@@ -164,45 +164,82 @@ def detect_head_and_shoulders(
 def detect_triangle_convergence(
     df: pd.DataFrame, highs: list[tuple[int, float]], lows: list[tuple[int, float]]
 ) -> list[dict[str, Any]]:
-    """偵測三角收斂"""
+    """使用線性回歸趨勢線偵測三角收斂，允許小幅插針誤差"""
     signals: list[dict[str, Any]] = []
     if len(highs) < 3 or len(lows) < 3:
         return signals
 
-    recent_h = highs[-3:]
-    recent_l = lows[-3:]
-    h_vals = [p for _, p in recent_h]
-    l_vals = [p for _, p in recent_l]
+    recent_h = highs[-4:] if len(highs) >= 4 else highs[-3:]
+    recent_l = lows[-4:] if len(lows) >= 4 else lows[-3:]
+    last_idx = len(df) - 1
 
-    falling_highs = h_vals[0] > h_vals[1] > h_vals[2]
-    rising_lows = l_vals[0] < l_vals[1] < l_vals[2]
-    flat_highs = abs(h_vals[0] - h_vals[2]) / h_vals[0] <= 0.006
-    flat_lows = abs(l_vals[0] - l_vals[2]) / l_vals[0] <= 0.006
+    # 確保收斂結構仍在近期，不是太久以前的舊型態
+    if (last_idx - max(recent_h[-1][0], recent_l[-1][0])) > 25:
+        return signals
+
+    hx = np.array([i for i, _ in recent_h], dtype=float)
+    hy = np.array([p for _, p in recent_h], dtype=float)
+    lx = np.array([i for i, _ in recent_l], dtype=float)
+    ly = np.array([p for _, p in recent_l], dtype=float)
+
+    if hx[-1] <= hx[0] or lx[-1] <= lx[0]:
+        return signals
+
+    slope_h, intercept_h = np.polyfit(hx, hy, 1)
+    slope_l, intercept_l = np.polyfit(lx, ly, 1)
+
+    start_x = min(hx[0], lx[0])
+    end_x = float(last_idx)
+    upper_start = slope_h * start_x + intercept_h
+    lower_start = slope_l * start_x + intercept_l
+    upper_now = slope_h * end_x + intercept_h
+    lower_now = slope_l * end_x + intercept_l
+
+    initial_range = upper_start - lower_start
+    current_range = upper_now - lower_now
+    if initial_range <= 0 or current_range <= 0:
+        return signals
+
+    # 允許小幅插針：只要整體振幅收縮至少 25% (current_range / initial_range <= 0.75)
+    if (current_range / initial_range) > 0.75:
+        return signals
+
+    mid_price = (upper_now + lower_now) / 2
+    flat_thresh = mid_price * 0.00015  # 每根 K 線變動小於萬分之 1.5 視為水平線
+
+    falling_h = slope_h < -flat_thresh
+    rising_l = slope_l > flat_thresh
+    flat_h = abs(slope_h) <= flat_thresh
+    flat_l = abs(slope_l) <= flat_thresh
 
     tri_type = None
-    if falling_highs and rising_lows:
+    if falling_h and rising_l:
         tri_type = "對稱三角收斂"
-    elif flat_highs and rising_lows:
+    elif flat_h and rising_l:
         tri_type = "上升三角收斂"
-    elif falling_highs and flat_lows:
+    elif falling_h and flat_l:
         tri_type = "下降三角收斂"
 
     if tri_type:
-        initial_range = h_vals[0] - l_vals[0]
-        current_range = h_vals[-1] - l_vals[-1]
-        if initial_range > 0 and (current_range / initial_range) <= 0.65:
-            last_close = float(df["close"].iloc[-1])
-            breakout_note = "處於末端收斂區間"
-            if last_close > h_vals[-1]:
-                breakout_note = "剛向上突破上緣"
-            elif last_close < l_vals[-1]:
-                breakout_note = "剛向下跌破下緣"
-            signals.append({
-                "pattern": tri_type,
-                "direction": "待方向確認" if "末端" in breakout_note else ("偏多" if "上" in breakout_note else "偏空"),
-                "detail": f"上緣 {h_vals[-1]:.2f} / 下緣 {l_vals[-1]:.2f}（{breakout_note}）",
-                "key_level": round(h_vals[-1] if "上" in breakout_note else l_vals[-1], 5),
-            })
+        last_close = float(df["close"].iloc[-1])
+        breakout_note = "處於末端收斂區間"
+        direction = "待方向確認"
+        key_lvl = upper_now
+        if last_close > upper_now * 1.001:
+            breakout_note = "剛向上突破上緣趨勢線"
+            direction = "偏多"
+            key_lvl = upper_now
+        elif last_close < lower_now * 0.999:
+            breakout_note = "剛向下跌破下緣趨勢線"
+            direction = "偏空"
+            key_lvl = lower_now
+
+        signals.append({
+            "pattern": tri_type,
+            "direction": direction,
+            "detail": f"上緣約 {upper_now:.2f} / 下緣約 {lower_now:.2f}（{breakout_note}）",
+            "key_level": round(float(key_lvl), 5),
+        })
     return signals
 
 
@@ -389,7 +426,6 @@ def render_chart_png(
     unique_levels = sorted({round(lvl, 5) for lvl in key_levels if lvl > 0})
     last_price = float(ohlcv_df["Close"].iloc[-1])
 
-    # 確保 Y 軸範圍涵蓋 TP 與 SL，不會被切掉
     all_y = [float(plot_df["low"].min()), float(plot_df["high"].max())]
     for v in (entry, stop_loss, take_profit, *unique_levels):
         if v is not None and v > 0:
@@ -416,7 +452,6 @@ def render_chart_png(
     ax_main = axes[0]
     n = len(ohlcv_df)
 
-    # 1. 標註最高價與最低價（仿 BingX 白色細指引線）
     hi_idx = int(plot_df["high"].idxmax())
     hi_val = float(plot_df["high"].iloc[hi_idx])
     lo_idx = int(plot_df["low"].idxmin())
@@ -448,7 +483,6 @@ def render_chart_png(
         fontweight="bold",
     )
 
-    # 2. 關鍵結構價位（黃色虛線，標籤放左側避免與右側 TP/SL 重疊）
     for lvl in unique_levels:
         ax_main.axhline(lvl, color="#f0b90b", linestyle="--", linewidth=1.0, alpha=0.85)
         ax_main.text(
@@ -463,7 +497,6 @@ def render_chart_png(
             bbox=dict(boxstyle="round,pad=0.18", facecolor="#1e1b10", edgecolor="#f0b90b", linewidth=0.9),
         )
 
-    # 3. 畫出 止盈 (綠) / 止損 (紅) / 入場 (白) 線與右側標籤框
     right_x = n + 1.5
     lines_to_draw: list[tuple[str, float, str, str, str]] = []
     if take_profit:
@@ -487,7 +520,6 @@ def render_chart_png(
             bbox=dict(boxstyle="round,pad=0.22", facecolor=bg_col, edgecolor=edge_col, linewidth=1),
         )
 
-    # 若沒有傳入 entry，至少標示現價
     if not entry:
         ax_main.plot([n - 1, n + 1.2], [last_price, last_price], color="#eaecef", linestyle=":", linewidth=1.0)
         ax_main.text(
