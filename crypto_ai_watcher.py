@@ -1,5 +1,5 @@
 """
-Crypto AI Vision Market Watcher（極速省時 + 8/10 高勝率標記 + 風險對齊建議槓桿倍率版）
+Crypto AI Vision Market Watcher（極速省時 + 8/10 高勝率標記 + 風險對齊建議槓桿倍率 + 嚴格防馬後炮版）
 """
 
 import argparse
@@ -470,27 +470,32 @@ def render_chart_png(
 def stage1_detect_pattern_from_chart(
     symbol: str, timeframe: str, df: pd.DataFrame, raw_chart_bytes: bytes
 ) -> dict[str, Any]:
-    """【AI 第一關】嚴格幾何校驗所有型態，防止把 V 型反轉或單邊回檔誤認成頭肩底/三角"""
+    """【AI 第一關】嚴格校驗型態規模、趨勢位置與時效性，杜絕微型假型態與馬後炮"""
     plot_df = df.tail(85).copy().reset_index(drop=True)
     pivots = _extract_chart_pivots(plot_df, window=3)
     last_price = float(plot_df["close"].iloc[-1])
     img_b64 = base64.b64encode(raw_chart_bytes).decode("utf-8")
 
-    prompt = f"""你是極度嚴謹的技術分析師。請觀察這張 {symbol} ({timeframe} 週期、共 85 根 K 線，最左 bar 0、最右最新收盤 bar 84) 的 K 線圖。
+    prompt = f"""你是極度挑剔的實戰派技術分析師。請觀察這張 {symbol} ({timeframe} 週期、共 85 根 K 線，最左 bar 0、最右最新收盤 bar 84) 的 K 線圖。
 目前收盤價 {_fmt_price(last_price)}，轉折點座標參考：
 {json.dumps(pivots, ensure_ascii=False)}
 
-請依序檢查「最右側（最新走勢）」是否**真正符合**以下任一幾何定義（必須先確認轉折點數量與位置吻合，不吻合就一律回傳 false，寧缺勿濫）：
-1. **頭肩頂**：必須有 3 個清楚波峰（左肩、明顯更高的頭部、右肩低於頭部），且中間有頸線；單純震盪不算。
-2. **頭肩底**：必須有 3 個清楚波谷（左肩、明顯更低的頭部、右肩高於頭部）。**注意：單純的 V 型反轉或跌深後一路階梯墊高，沒有清楚獨立左肩與右肩波谷，絕對不算頭肩底！**
-3. **M 頭 (Double Top)**：必須有 2 個高度相近的波段高點（誤差約 1.5% 內）與中間頸線。
-4. **W 底 (Double Bottom)**：必須有 2 個深度相近的波段低點（誤差約 1.5% 內）與中間頸線。
-5. **三角收斂 / 楔形**：上緣必須至少有 2 個高點、下緣必須至少有 2 個低點，兩條邊線明顯向右側收攏；單一尖頭回檔不算。
-6. **上升 / 下降通道或旗形**：上下緣各有至少 2 個觸及點且大致平行。
-7. **關鍵支撐壓力突破 / 假跌破假突破獵取 (Liquidity Sweep)**：最新幾根 K 線明確放量突破或長影線刺破前期顯著高低點後收回。
+【最高優先級淘汰條款 — 違反任一條就必須回傳 has_pattern = false】：
+1. **嚴禁馬後炮（時效性）**：型態必須處於「剛成形接近頸線/邊線」或「剛突破/跌破後的 1～3 根 K 線內」。如果價格早就突破/跌破頸線並走完主要漲跌幅（例如已經殺到低點又反彈），**一律回傳 false**！
+2. **嚴禁微型假型態（規模）**：M 頭 / W 底的兩個頂部或底部之間，**至少必須間隔 6 根以上 K 線**，且中間頸線回調幅度必須肉眼清晰可見；相鄰幾根 K 線的雙針或淺回調絕對不算！
+3. **趨勢位置必須合理**：M 頭 / 頭肩頂必須出現在「一段上漲後的高位」；W 底 / 頭肩底必須出現在「一段下跌後的低位」。下跌途中的微小反彈受阻不算 M 頭。
 
-若沒有明確符合上述定義的結構，請務必設 `has_pattern = false`。
-若確認符合，請先在 `pattern_note` 寫出具體各轉折點 bar 位置，再回傳 `trend_lines`：
+在通過上述淘汰條款後，再檢查「最右側（最新走勢）」是否**真正符合**以下任一幾何定義（寧缺勿濫）：
+1. **頭肩頂**：3 個清楚獨立波峰（左肩、明顯更高的頭部、右肩低於頭部）與頸線。
+2. **頭肩底**：3 個清楚獨立波谷（左肩、明顯更低的頭部、右肩高於頭部）與頸線；單純 V 型反轉不算。
+3. **M 頭 (Double Top)**：2 個高度相近的波段高點（誤差約 1.5% 內、間隔 ≥ 6 根 K 線）與清楚頸線。
+4. **W 底 (Double Bottom)**：2 個深度相近的波段低點（誤差約 1.5% 內、間隔 ≥ 6 根 K 線）與清楚頸線。
+5. **三角收斂 / 楔形**：上緣 ≥ 2 個高點、下緣 ≥ 2 個低點，兩條邊線明顯向右側收攏，且價格正處於末端即將突破或剛突破。
+6. **上升 / 下降通道或旗形**：上下緣各有 ≥ 2 個觸及點且大致平行，目前價格正處於通道邊緣或剛突破。
+7. **關鍵支撐壓力突破 / 假跌破假突破獵取 (Liquidity Sweep)**：最近 1～3 根 K 線明確放量突破，或長影線刺破前期顯著高低點後收回。
+
+若沒有明確符合，請務必設 `has_pattern = false`。
+若確認符合，請先在 `pattern_note` 寫出具體各轉折點 bar 位置與間隔 K 線數，再回傳 `trend_lines`：
 - 三角 / 楔形 / 通道：回傳 **2 條獨立直線**（第 1 條連上緣高點、第 2 條連下緣低點）。
 - M 頭 / W 底 / 頭肩：回傳 **1 條嚴格交替轉折的折線**（例如頭肩底為：高-左肩低-高-頭低-高-右肩低-高）。
 
@@ -500,7 +505,7 @@ def stage1_detect_pattern_from_chart(
   "pattern_name": "型態名稱",
   "bias": "偏多" 或 "偏空" 或 "待突破確認",
   "trend_lines": [[[bar, price], [bar, price], ...]],
-  "pattern_note": "寫出具體轉折點 bar 位置與結構說明"
+  "pattern_note": "寫出具體轉折點 bar 位置、間隔 K 線數與結構說明"
 }}"""
 
     return _call_gemini([
@@ -512,21 +517,22 @@ def stage1_detect_pattern_from_chart(
 def stage2_score_risk_and_plan(
     symbol: str, timeframe: str, df: pd.DataFrame, raw_chart_bytes: bytes, stage1_result: dict[str, Any]
 ) -> dict[str, Any]:
-    """【AI 第二關】風控評分"""
+    """【AI 第二關】風控評分 + 馬後炮否決權"""
     recent = df.tail(25)[["dt", "open", "high", "low", "close", "volume", "ema20", "ema50", "rsi", "atr"]].copy()
     recent["dt"] = recent["dt"].dt.strftime("%m-%d %H:%M")
     candles_text = recent.round(4).to_string(index=False)
     img_b64 = base64.b64encode(raw_chart_bytes).decode("utf-8")
 
-    prompt = f"""你是嚴謹的加密貨幣交易風控官。第一關看圖辨識在 {symbol} ({timeframe}) 發現了型態：
+    prompt = f"""你是極度嚴格的加密貨幣交易風控官。第一關看圖辨識在 {symbol} ({timeframe}) 發現了型態：
 {json.dumps(stage1_result, ensure_ascii=False)}
 
 以下為最近 25 根 K 線與均線/RSI/ATR 數據：
 {candles_text}
 
-請同時對照 K 線圖與量價數據進行嚴格風險評估：
-1. 評估是否有逆勢撞均線、量能背離、止損位置合理性，給出 `risk_score`（1 到 10 的整數，8 分以上代表極高勝率 80%+ 優質機會）。
-2. 給出具體的 `entry`（入場點）、`stop_loss`（止損點）、`take_profit`（止盈點，風報比至少 1:1.8）。
+請同時對照 K 線圖與量價數據進行嚴格複審與風險評估：
+1. **否決權檢查**：如果第一關抓的型態其實很牽強（例如兩個頂/底太擠、結構太小），或是「行情早就突破/跌破並走完一大段，現在進場已經太晚（追高殺低或馬後炮）」，請直接將 `risk_score` 壓低到 **4 分以下** 予以否決。
+2. 評估是否順勢、有無撞均線壓力/支撐、量能是否配合、止損位置是否合理，給出 `risk_score`（1 到 10 的整數，8 分以上代表極高勝率 80%+ 優質機會）。
+3. 給出具體的 `entry`（入場點）、`stop_loss`（止損點）、`take_profit`（止盈點，風報比至少 1:1.8）。
 
 只回傳純 JSON：
 {{
