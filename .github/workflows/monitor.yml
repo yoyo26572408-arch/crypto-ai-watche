@@ -16,7 +16,14 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-
+          
+      - name: 讀取與保存防重複推播紀錄
+        uses: actions/cache@v4
+        with:
+          path: sent_history.json
+          key: alert-history-${{ github.run_id }}
+          restore-keys: |
+             alert-history-
       - name: 安裝必要套件
         run: |
           pip install --upgrade pip
@@ -27,7 +34,7 @@ jobs:
           EXCHANGE_ID: "bingx" 
           SYMBOLS: "BTC/USDT:USDT,ETH/USDT:USDT,SOL/USDT:USDT,SUI/USDT:USDT,ZEC/USDT:USDT"
           TIMEFRAMES: "30m,1h,4h,1d"
-          MIN_AI_CONFIDENCE: "6"
+          MIN_AI_CONFIDENCE: "7"
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
