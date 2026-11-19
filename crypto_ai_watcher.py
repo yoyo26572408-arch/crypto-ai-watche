@@ -212,10 +212,10 @@ def _call_gemini(parts: list[dict[str, Any]]) -> dict[str, Any]:
             "contents": [{"parts": parts}],
             "generationConfig": {"responseMimeType": "application/json"},
         }
-        for attempt in range(1, 3):
+        for attempt in range(1, 4):
             time.sleep(0.6)
             try:
-                resp = requests.post(url, json=payload, timeout=35)
+                resp = requests.post(url, json=payload, timeout=(10, 65))
                 if resp.status_code == 404:
                     last_exc = requests.HTTPError(f"404 Not Found for {model_name}", response=resp)
                     break
@@ -249,6 +249,7 @@ def render_chart_png(
     take_profit: float | None = None,
     trend_lines: list[list[list[float]]] | None = None,
     high_prob_score: int | None = None,
+    dpi: int = 180,
 ) -> bytes:
     """繪製仿 BingX / TradingView 風格 K 線圖（含 8/10+ 高勝率金色徽章）"""
     if "ema20" not in df.columns:
@@ -456,7 +457,7 @@ def render_chart_png(
                 bbox=dict(boxstyle="round,pad=0.22", facecolor="#1e2329", edgecolor="#eaecef", linewidth=1),
             )
 
-        fig.savefig(buf, dpi=220, bbox_inches="tight", facecolor="#0b0e11")
+        fig.savefig(buf, dpi=dpi, bbox_inches="tight", facecolor="#0b0e11")
     finally:
         plt.close(fig)
 
@@ -654,7 +655,7 @@ def run(ignore_time_window: bool = False) -> None:
                     continue
 
                 df = add_indicators(df)
-                raw_chart = render_chart_png(df, symbol, tf)
+                raw_chart = render_chart_png(df, symbol, tf, dpi=110)
 
                 s1 = stage1_detect_pattern_from_chart(symbol, tf, df, raw_chart)
                 if not s1.get("has_pattern"):
