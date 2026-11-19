@@ -27,7 +27,7 @@ jobs:
           EXCHANGE_ID: "bingx" 
           SYMBOLS: "BTC/USDT:USDT,ETH/USDT:USDT,SOL/USDT:USDT,SUI/USDT:USDT,ZEC/USDT:USDT"
           TIMEFRAMES: "30m,1h,4h,1d"
-          MIN_AI_CONFIDENCE: "6"
+          MIN_AI_CONFIDENCE: "2"
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
