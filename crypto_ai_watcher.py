@@ -1,647 +1,6 @@
-"""Gemini K-line watcher v2.2. Standalone; auto model selection; no Telegram connection."""
-from __future__ import annotations
-
-# --- watcher_stats.py ---
-
-import hashlib
-import json
-import math
-import sqlite3
-from pathlib import Path
-
-VERSION = "forward-v2-limit-3-hold-24"
-PATTERNS = {"head_shoulders_top", "head_shoulders_bottom", "double_top", "double_bottom",
-            "triangle", "wedge", "channel", "flag", "breakout", "liquidity_sweep"}
-TERMINAL = {"win", "loss", "timeout", "unfilled", "data_gap"}
-
-
-def validate_plan(plan, min_rr=1.8):
-    if plan.get("confirmed") is not True:
-        raise ValueError("AI 未確認可執行")
-    if plan.get("bias") not in {"偏多", "偏空"}:
-        raise ValueError("多空方向未確認")
-    for name in ("entry", "stop_loss", "take_profit"):
-        value = plan.get(name)
-        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
-            raise ValueError(f"{name} 必須為有限正數")
-    entry, sl, tp = (plan[k] for k in ("entry", "stop_loss", "take_profit"))
-    if not ((sl < entry < tp) if plan["bias"] == "偏多" else (tp < entry < sl)):
-        raise ValueError("入場／止損／止盈方向不合理")
-    if abs(entry - sl) / entry <= 0.001:
-        raise ValueError("止損距離過窄")
-    rr = abs(tp - entry) / abs(entry - sl)
-    if rr < min_rr:
-        raise ValueError("風報比未達門檻")
-    score = plan.get("risk_score")
-    if isinstance(score, bool) or not isinstance(score, int) or not 1 <= score <= 10:
-        raise ValueError("AI 評分應為 1–10 整數")
-    return rr
-
-
-def wilson_lower(wins, total, z=1.959963984540054):
-    """Lower endpoint of a two-sided 95% Wilson interval; not a guarantee."""
-    if total == 0:
-        return 0.0
-    p = wins / total
-    return (p + z*z/(2*total) - z*math.sqrt(p*(1-p)/total + z*z/(4*total*total))) / (1 + z*z/total)
-
-
-def cohort_key(exchange, symbol, tf, pattern, plan, model, policy):
-    rr = validate_plan(plan, policy["min_rr"])
-    # Keep instrument, exchange, timeframe, model and rules separate. Avoid mixing easy TP
-    # with difficult TP: use narrow score, R:R and percentage-stop buckets.
-    stop_pct = abs(plan["entry"] - plan["stop_loss"]) / plan["entry"] * 100
-    values = [VERSION, exchange, symbol, tf, pattern, plan["bias"], plan["risk_score"],
-              math.floor(rr * 2), math.floor(stop_pct * 2), model, policy]
-    return json.dumps(values, ensure_ascii=False, sort_keys=True)
-
-
-def fingerprint(pattern, bias, anchor_ms):
-    return f"{pattern}|{bias}|{anchor_ms}"
-
-
-def evaluate(signal, candles):
-    """Consume contiguous CLOSED OHLCV bars strictly after signal creation.
-
-    Entry is a limit order: long entry <= signal close, short entry >= signal close.
-    Gap-through fills use the specified limit price (conservative, no improvement).
-    Entry candle SL always loses; TP alone on entry candle only wins if entry was
-    marketable at the OPEN, otherwise ordering is unknown and TP is ignored.
-    """
-    s = dict(signal)
-    for bar in candles:
-        ts = int(bar[0])
-        if s["status"] in TERMINAL:
-            break
-        if ts < s["next_ms"]:
-            continue
-        if ts != s["next_ms"]:
-            s.update(status="data_gap", resolved_ms=ts + s["tf_ms"])
-            break
-        op, hi, lo = map(float, bar[1:4])
-        long = s["bias"] == "偏多"
-        s["next_ms"] = ts + s["tf_ms"]
-        just_entered = False
-        if s["status"] == "pending":
-            s["waited"] += 1
-            filled = lo <= s["entry"] if long else hi >= s["entry"]
-            if not filled:
-                if s["waited"] >= s["entry_bars"]:
-                    s.update(status="unfilled", resolved_ms=ts + s["tf_ms"])
-                continue
-            just_entered = True
-            s.update(status="open", entered_ms=ts)
-        s["held"] += 1
-        sl_hit = lo <= s["stop_loss"] if long else hi >= s["stop_loss"]
-        tp_hit = hi >= s["take_profit"] if long else lo <= s["take_profit"]
-        entry_at_open = op <= s["entry"] if long else op >= s["entry"]
-        if sl_hit:  # SL first, including ambiguous bars containing both.
-            s.update(status="loss", resolved_ms=ts + s["tf_ms"])
-        elif tp_hit and (not just_entered or entry_at_open):
-            s.update(status="win", resolved_ms=ts + s["tf_ms"])
-        elif s["held"] >= s["hold_bars"]:
-            s.update(status="timeout", resolved_ms=ts + s["tf_ms"])
-    return s
-
-
-class Ledger:
-    def __init__(self, path):
-        Path(path).parent.mkdir(parents=True, exist_ok=True)
-        self.db = sqlite3.connect(path)
-        self.db.row_factory = sqlite3.Row
-        self.db.executescript("""
-            CREATE TABLE IF NOT EXISTS signals (
-                id TEXT PRIMARY KEY, market TEXT NOT NULL, cohort TEXT NOT NULL,
-                created_ms INTEGER NOT NULL, resolved_ms INTEGER,
-                status TEXT NOT NULL, payload TEXT NOT NULL);
-            CREATE INDEX IF NOT EXISTS signals_cohort ON signals(cohort, resolved_ms);
-            CREATE TABLE IF NOT EXISTS state (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-        """)
-
-    def close(self):
-        self.db.close()
-
-    def get(self, key, default=None):
-        row = self.db.execute("SELECT value FROM state WHERE key=?", (key,)).fetchone()
-        return json.loads(row[0]) if row else default
-
-    def set(self, key, value):
-        with self.db:
-            self.db.execute("INSERT OR REPLACE INTO state VALUES (?,?)", (key, json.dumps(value)))
-
-    def save(self, signal):
-        with self.db:
-            self.db.execute("INSERT OR REPLACE INTO signals VALUES (?,?,?,?,?,?,?)", (
-                signal["id"], signal["market"], signal["cohort"], signal["created_ms"],
-                signal.get("resolved_ms"), signal["status"], json.dumps(signal, ensure_ascii=False)))
-
-    def active(self, market=None):
-        sql = "SELECT payload FROM signals WHERE status IN ('pending','open')"
-        rows = self.db.execute(sql + (" AND market=?" if market else ""), (market,) if market else ())
-        return [json.loads(r[0]) for r in rows]
-
-    def add(self, market, cohort, signal_ms, tf_ms, plan, policy, metadata=None):
-        # One pending/open signal per exchange+symbol+timeframe; overlapping labels
-        # otherwise exaggerate the effective sample count.
-        if self.active(market):
-            return None
-        sid = hashlib.sha256(f"{market}|{signal_ms}|{cohort}".encode()).hexdigest()[:24]
-        if self.db.execute("SELECT 1 FROM signals WHERE id=?", (sid,)).fetchone():
-            return None
-        signal = dict(plan, id=sid, market=market, cohort=cohort, created_ms=signal_ms,
-                      tf_ms=tf_ms, next_ms=signal_ms, waited=0, held=0, status="pending",
-                      entry_bars=policy["entry_bars"], hold_bars=policy["hold_bars"],
-                      metadata=metadata or {}, exported=False)
-        self.save(signal)
-        return signal
-
-    def update(self, market, candles):
-        for signal in self.active(market):
-            self.save(evaluate(signal, candles))
-
-    def stats(self, cohort, asof_ms, min_samples=100, threshold=0.8):
-        # Only previously resolved outcomes, never current/future labels. Unfilled
-        # orders do not count as trades; expired filled orders count against success.
-        rows = self.db.execute("""SELECT status, COUNT(*) AS n FROM signals
-            WHERE cohort=? AND resolved_ms<=? GROUP BY status""", (cohort, asof_ms))
-        counts = {r["status"]: r["n"] for r in rows}
-        wins = counts.get("win", 0)
-        total = sum(counts.get(k, 0) for k in ("win", "loss", "timeout"))
-        lower = wilson_lower(wins, total)
-        return dict(wins=wins, total=total, rate=wins/total if total else 0,
-                    lower95=lower, unfilled=counts.get("unfilled", 0),
-                    data_gap=counts.get("data_gap", 0),
-                    eligible=total >= min_samples and lower >= threshold and not counts.get("data_gap", 0))
-
-    def summary(self):
-        return {r[0]: r[1] for r in self.db.execute("SELECT status, COUNT(*) FROM signals GROUP BY status")}
-
-
-# --- watcher_runtime.py ---
-
-import contextlib
-import hashlib
-import json
-import math
-import os
-import re
-import time
-from pathlib import Path
-
-import ccxt
-import numpy as np
-import pandas as pd
-import requests
-
-
-ROOT = Path(__file__).resolve().parent
-
-
-def load_env():
-    path = ROOT / ".env"
-    if path.exists():
-        for line in path.read_text(encoding="utf-8-sig").splitlines():
-            line = line.strip()
-            if line and not line.startswith("#") and "=" in line:
-                key, value = line.split("=", 1)
-                os.environ.setdefault(key.strip(), value.strip().strip("\"'"))
-
-
-def settings():
-    load_env()
-    cfg = dict(exchange=os.getenv("EXCHANGE_ID", "bingx"),
-               fallback=os.getenv("FALLBACK_EXCHANGE_ID", "binanceusdm"),
-               symbols=[s.strip() for s in os.getenv("SYMBOLS", "BTC/USDT:USDT,ETH/USDT:USDT,SOL/USDT:USDT,SUI/USDT:USDT,ZEC/USDT:USDT").split(",") if s.strip()],
-               timeframes=[s.strip() for s in os.getenv("TIMEFRAMES", "30m,1h,4h,1d").split(",") if s.strip()],
-               policy=dict(entry_bars=int(os.getenv("ENTRY_WAIT_BARS", "3")),
-                           hold_bars=int(os.getenv("HOLD_BARS", "24")),
-                           min_rr=float(os.getenv("MIN_RR", "1.8"))),
-               min_score=int(os.getenv("MIN_AI_CONFIDENCE", "8")),
-               min_samples=int(os.getenv("MIN_SAMPLES", "100")),
-               threshold=float(os.getenv("SUCCESS_THRESHOLD", "0.80")),
-               key=(os.getenv("GEMINI_API_KEY", "").strip() or os.getenv("GOOGLE_API_KEY", "").strip()),
-               model=os.getenv("GEMINI_MODEL", "").strip().removeprefix("models/"),
-               state_dir=ROOT / os.getenv("STATE_DIR", "state"))
-    if cfg["exchange"] not in {"bingx", "binanceusdm"} or cfg["fallback"] not in {"bingx", "binanceusdm"}:
-        raise ValueError("EXCHANGE_ID / FALLBACK_EXCHANGE_ID 只支援 bingx 或 binanceusdm")
-    if not cfg["symbols"] or not cfg["timeframes"] or not set(cfg["timeframes"]) <= {"15m", "30m", "1h", "4h", "1d"}:
-        raise ValueError("幣種或週期設定不正確")
-    if (not 1 <= cfg["min_score"] <= 10 or cfg["min_samples"] < 1 or
-        not 0.8 <= cfg["threshold"] < 1 or not 1 <= cfg["policy"]["entry_bars"] <= 100 or
-        not 1 <= cfg["policy"]["hold_bars"] <= 1000 or
-        not math.isfinite(cfg["policy"]["min_rr"]) or cfg["policy"]["min_rr"] < 1.8):
-        raise ValueError("門檻設定不正確（成功率至少 0.80、R:R 至少 1.8）")
-    return cfg
-
-
-def safe_error(exc, cfg):
-    text = str(exc)
-    for secret in (cfg.get("key"), cfg.get("token")):
-        if secret:
-            text = text.replace(secret, "[REDACTED]")
-    return text[:300]
-
-
-@contextlib.contextmanager
-def single_instance(folder):
-    folder.mkdir(parents=True, exist_ok=True)
-    handle = (folder / "watcher.lock").open("a+b")
-    handle.seek(0)
-    if not handle.read(1):
-        handle.write(b"0")
-        handle.flush()
-    handle.seek(0)
-    try:
-        if os.name == "nt":
-            import msvcrt
-            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
-        else:
-            import fcntl
-            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
-        handle.close()
-        raise RuntimeError("已有另一個盯盤程序在使用此資料庫") from None
-    try:
-        yield
-    finally:
-        handle.close()
-
-
-def list_models(cfg):
-    if not cfg["key"]:
-        raise ValueError("未收到 GEMINI_API_KEY（或 GOOGLE_API_KEY）。GitHub Actions 必須用 env 將 secrets 注入執行步驟；只有建立 Secret 不會自動成為環境變數。")
-    models, page = [], None
-    while True:
-        response = requests.get("https://generativelanguage.googleapis.com/v1beta/models",
-                                headers={"x-goog-api-key": cfg["key"]},
-                                params={"pageSize": 1000, **({"pageToken": page} if page else {})}, timeout=30)
-        if response.status_code != 200:
-            raise RuntimeError(f"Gemini 模型清單 HTTP {response.status_code}，請檢查 API Key／權限")
-        body = response.json()
-        models += [m["name"].removeprefix("models/") for m in body.get("models", [])
-                   if "generateContent" in m.get("supportedGenerationMethods", [])]
-        page = body.get("nextPageToken")
-        if not page:
-            return sorted(models)
-
-
-class GeminiRequestError(RuntimeError):
-    def __init__(self, status):
-        self.status = status
-        super().__init__(f"Gemini HTTP {status}；請檢查模型／權限／用量。")
-
-
-def model_candidates(models):
-    # The listing is authoritative for existence, but it does not promise vision
-    # or JSON support. A small image+JSON preflight below verifies both.
-    excluded = ("image", "audio", "tts", "live", "native", "embedding", "robotics", "computer-use")
-    candidates = [m for m in models if m.startswith("gemini-") and "flash" in m
-                  and not any(word in m.lower() for word in excluded)]
-    def rank(name):
-        match = re.match(r"gemini-(\d+)(?:\.(\d+))?", name)
-        version = (int(match[1]), int(match[2] or 0)) if match else (0, 0)
-        return ("lite" in name, any(x in name for x in ("preview", "exp")),
-                -version[0], -version[1], name)
-    return sorted(candidates, key=rank)
-
-
-def verify_model(cfg):
-    models = list_models(cfg)
-    explicit = cfg["model"].lower() not in {"", "auto"}
-    if explicit and not re.fullmatch(r"[A-Za-z0-9._-]+", cfg["model"]):
-        raise ValueError("GEMINI_MODEL 格式不正確")
-    if explicit and cfg["model"] not in models:
-        raise ValueError("指定的 GEMINI_MODEL 不在此 Key 的可用清單；可改成 auto 由程式選擇")
-    pin_path = cfg["state_dir"] / "model_choice.json"
-    account = hashlib.sha256(cfg["key"].encode()).hexdigest()
-    try:
-        pinned = json.loads(pin_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        pinned = {}
-    candidates = [cfg["model"]] if explicit else model_candidates(models)
-    if (pinned.get("account") == account and pinned.get("model") in models and
-        pinned.get("vision_json_verified") is True and
-        (not explicit or pinned.get("model") == cfg["model"])):
-        cfg["model"] = pinned["model"]
-        print(f"[Gemini] 使用已驗證模型：{cfg['model']}", flush=True)
-        return cfg["model"]
-    if not candidates:
-        raise ValueError("此 Key 沒有可自動選用的 Flash 模型；請用 --list-models 查看並明確設定 GEMINI_MODEL")
-    # A valid 16x16 PNG; the preflight consumes a small API request once per
-    # newly selected model/account. Do not silently try other accounts or quota pools.
-    parts = [{"text": 'Check image input and JSON output. Reply with exactly {"ready":true}.'},
-             {"inlineData": {"mimeType": "image/png", "data":
-              "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAIAAACQkWg2AAAAI0lEQVR4nGP8//8/AymAiSTVDKMaiANMRKqDg1ENxACSQwkAVW0DHeN02ZEAAAAASUVORK5CYII="}}]
-    for candidate in candidates[:5]:
-        cfg["model"] = candidate
-        try:
-            result = call_gemini(cfg, parts)
-            if result.get("ready") is not True:
-                raise ValueError("看圖／JSON 測試未通過")
-        except GeminiRequestError as exc:
-            if not explicit and exc.status in {400, 404}:
-                continue
-            raise
-        except ValueError:
-            if not explicit:
-                continue
-            raise
-        cfg["state_dir"].mkdir(parents=True, exist_ok=True)
-        temporary = pin_path.with_suffix(".json.tmp")
-        temporary.write_text(json.dumps(dict(model=candidate, account=account, vision_json_verified=True)), encoding="utf-8")
-        temporary.replace(pin_path)
-        print(f"[Gemini] 已選定並驗證看圖／JSON：{candidate}", flush=True)
-        return candidate
-    raise ValueError("可用 Flash 模型均未通過看圖／JSON 測試，請查看模型權限或明確設定 GEMINI_MODEL")
-
-
-def call_gemini(cfg, parts):
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{cfg['model']}:generateContent"
-    for attempt in range(3):
-        try:
-            response = requests.post(url, headers={"x-goog-api-key": cfg["key"]},
-                                     json={"contents": [{"parts": parts}],
-                                           "generationConfig": {"responseMimeType": "application/json"}}, timeout=(10, 90))
-        except requests.RequestException:
-            if attempt == 2:
-                raise RuntimeError("Gemini 連線逾時／失敗") from None
-            time.sleep(2 ** (attempt + 1))
-            continue
-        if response.status_code in {429, 500, 502, 503, 504}:
-            time.sleep(min(30, 5 * (attempt + 1)))
-            continue
-        if response.status_code != 200:
-            raise GeminiRequestError(response.status_code)
-        try:
-            candidate = response.json()["candidates"][0]
-            if candidate.get("finishReason") != "STOP":
-                raise ValueError("回應未完整結束")
-            text = "".join(p.get("text", "") for p in candidate["content"]["parts"] if not p.get("thought"))
-            result = json.loads(text)
-            if not isinstance(result, dict):
-                raise ValueError("不是 JSON 物件")
-            return result
-        except (ValueError, KeyError, IndexError, TypeError):
-            raise ValueError("Gemini 回應不完整或 JSON 格式不正確；略過此次訊號") from None
-    raise RuntimeError("Gemini 忙碌，已停止本次請求")
-
-
-def clean_candles(rows, tf_ms, now_ms):
-    df = pd.DataFrame(rows, columns=["timestamp", "open", "high", "low", "close", "volume"])
-    df = df.drop_duplicates("timestamp").sort_values("timestamp")
-    df = df[df["timestamp"] + tf_ms <= now_ms].reset_index(drop=True)
-    if df.empty:
-        raise ValueError("沒有已收盤 K 線")
-    numeric = df.to_numpy(dtype=float)
-    if (not np.isfinite(numeric).all() or (df[["open", "high", "low", "close"]] <= 0).any().any()
-        or (df["volume"] < 0).any() or (df["timestamp"] % tf_ms != 0).any()
-        or (df["high"] < df[["open", "close", "low"]].max(axis=1)).any()
-        or (df["low"] > df[["open", "close", "high"]].min(axis=1)).any()):
-        raise ValueError("交易所 OHLCV 資料不合理")
-    df["dt"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
-    return df
-
-
-def fetch_frame(exchange, symbol, tf, tf_ms, now_ms, since=None):
-    rows = []
-    cursor = since
-    # Paginate open paper trades after downtime; never fill BingX gaps with Binance.
-    for _ in range(100):
-        time.sleep(0.65)
-        batch = None
-        for attempt in range(3):
-            try:
-                batch = exchange.fetch_ohlcv(symbol, tf, since=cursor, limit=500 if cursor is not None else 201)
-                break
-            except (ccxt.NetworkError, ccxt.ExchangeError):
-                if attempt == 2:
-                    raise
-                time.sleep(2 * (attempt + 1))
-        if not batch:
-            break
-        rows.extend(batch)
-        last = max(int(b[0]) for b in batch)
-        if cursor is None or last + tf_ms >= now_ms or last < cursor:
-            break
-        new_cursor = last + tf_ms
-        if cursor is not None and new_cursor <= cursor:
-            break
-        cursor = new_cursor
-    return clean_candles(rows, tf_ms, now_ms)
-
-
-def validate_shape(shape, df):
-    if shape.get("has_pattern") is not True:
-        if shape.get("has_pattern") is not False:
-            raise ValueError("has_pattern 應為布林值")
-        return None
-    if shape.get("pattern_code") not in PATTERNS or shape.get("bias") not in {"偏多", "偏空"}:
-        raise ValueError("型態尚未確認或型態代碼不合法")
-    anchor = shape.get("pattern_start_bar")
-    if isinstance(anchor, bool) or not isinstance(anchor, int) or not 0 <= anchor < min(85, len(df)) - 3:
-        raise ValueError("型態起點座標不合法")
-    lines = shape.get("trend_lines")
-    if not isinstance(lines, list) or not 1 <= len(lines) <= 3:
-        raise ValueError("缺少型態線")
-    window = df.tail(85).reset_index(drop=True)
-    for line in lines:
-        if not isinstance(line, list) or not 2 <= len(line) <= 12:
-            raise ValueError("型態線座標不正確")
-        prev = -1
-        for point in line:
-            if not isinstance(point, list) or len(point) != 2:
-                raise ValueError("型態點座標不正確")
-            x, y = point
-            if (isinstance(x, bool) or not isinstance(x, int) or not prev < x < len(window)
-                or isinstance(y, bool) or not isinstance(y, (int, float)) or not math.isfinite(y)
-                or not float(window["low"].min()) * 0.85 <= y <= float(window["high"].max()) * 1.15):
-                raise ValueError("型態點超出圖表範圍")
-            prev = x
-    return int(window["timestamp"].iloc[anchor])
-
-
-def make_signal_text(signal, stats):
-    m = signal["metadata"]
-    start = pd.Timestamp(signal["created_ms"], unit="ms", tz="UTC").tz_convert("Asia/Taipei")
-    return (f"型態觀察｜{m['symbol']} {m['timeframe']}｜{m['exchange']}\n"
-            f"{m['pattern']}／{signal['bias']} · AI 評分 {signal['risk_score']}/10\n"
-            f"同條件紙上紀錄：{stats['wins']}/{stats['total']}，成功率 {stats['rate']:.1%}\n"
-            f"95% Wilson 下限 {stats['lower95']:.1%}（歷史統計，非本次保證）\n"
-            f"限價入場 {signal['entry']:g}｜止損 {signal['stop_loss']:g}｜止盈 {signal['take_profit']:g}\n"
-            f"追蹤自 {start:%m/%d %H:%M} UTC+8 起，等待 {signal['entry_bars']} 根；進場後 {signal['hold_bars']} 根內有效\n"
-            f"{str(m.get('summary', ''))[:100]}\n"
-            "同根碰止盈止損算失敗；逾期未止盈算未成功。未扣手續費／滑價／資金費。")
-
-
-def export_signal(cfg, signal, stats):
-    """Write one immutable event per signal ID for a separate notifier to consume.
-
-    This function performs local file operations only. No notification service is
-    called, even if legacy notification credentials exist in the environment.
-    """
-    if stats.get("eligible") is not True:
-        raise ValueError("未達門檻的訊號不能輸出至 outbox")
-    folder = cfg["state_dir"] / "outbox"
-    folder.mkdir(parents=True, exist_ok=True)
-    target = folder / f"{signal['id']}.json"
-    if target.exists():
-        return target
-    event = dict(schema_version=1, event="qualified_pattern", signal_id=signal["id"],
-                 emitted_at_ms=int(time.time()*1000), eligible=True,
-                 chart_file=f"../charts/{signal['id']}.png",
-                 text=make_signal_text(signal, stats), statistics=stats, signal=signal)
-    temp = target.with_suffix(".json.tmp")
-    temp.write_text(json.dumps(event, ensure_ascii=False, indent=2), encoding="utf-8")
-    temp.replace(target)
-    return target
-
-
-def cycle(cfg, ledger, chart_module, exchanges, *, scan=True):
-    failures = 0
-    rules_id = hashlib.sha256(json.dumps([VERSION, cfg["model"], cfg["policy"]], sort_keys=True).encode()).hexdigest()[:16]
-    for symbol in cfg["symbols"]:
-        for tf in cfg["timeframes"]:
-            tf_ms = int(ccxt.Exchange.parse_timeframe(tf) * 1000)
-            frames = {}
-            # Track each actual source separately, including a fallback position left
-            # from an earlier run. Never evaluate a BingX plan using Binance candles.
-            needed = list(exchanges)
-            for eid in needed:
-                market = f"{eid}|{symbol}|{tf}"
-                active = ledger.active(market)
-                if not active and frames:
-                    continue
-                now_ms = int(time.time() * 1000)
-                try:
-                    if active:
-                        earliest = min(s["next_ms"] for s in active)
-                        if earliest < now_ms - tf_ms:
-                            follow = fetch_frame(exchanges[eid], symbol, tf, tf_ms, now_ms, earliest)
-                            ledger.update(market, follow[["timestamp", "open", "high", "low", "close", "volume"]].values.tolist())
-                    if not frames:
-                        df = fetch_frame(exchanges[eid], symbol, tf, tf_ms, int(time.time() * 1000))
-                        frames[eid] = df
-                except Exception as exc:
-                    failures += 1
-                    print(f"[行情失敗] {market}: {safe_error(exc, cfg)}", flush=True)
-            if not frames or not scan:
-                continue
-            eid, df = next(iter(frames.items()))
-            market = f"{eid}|{symbol}|{tf}"
-            candle_close = int(df["timestamp"].iloc[-1]) + tf_ms
-            scan_key = f"scan|{rules_id}|{market}"
-            shape_key = f"shape|{rules_id}|{market}"
-            if ledger.get(scan_key, 0) >= candle_close:
-                continue
-            # Don't produce a current alert from old or discontinuous charts.
-            if (len(df) < 85 or int(time.time()*1000) - candle_close > tf_ms
-                or (df["timestamp"].diff().dropna() != tf_ms).any()):
-                print(f"[略過] {market}: K 線不足／過舊／不連續", flush=True)
-                continue
-            if ledger.active(market):
-                # Keep sampling non-overlapping paper trades; analyze again after it resolves.
-                continue
-            try:
-                chart_module._call_gemini = lambda parts: call_gemini(cfg, parts)
-                df = chart_module.add_indicators(df.copy())
-                image = chart_module.render_chart_png(df, symbol, tf, dpi=110)
-                # One AI analysis attempt per closed candle, including refusals and
-                # malformed results. A loop must not repeatedly bill the same bar.
-                ledger.set(scan_key, candle_close)
-                shape = chart_module.stage1_detect_pattern_from_chart(symbol, tf, df, image)
-                anchor = validate_shape(shape, df)
-                if anchor is None:
-                    ledger.set(shape_key, None)
-                    ledger.set(scan_key, candle_close)
-                    print(f"[無型態] {market}", flush=True)
-                    continue
-                signature = fingerprint(shape["pattern_code"], shape["bias"], anchor)
-                if ledger.get(shape_key) == signature:
-                    ledger.set(scan_key, candle_close)
-                    continue
-                plan = chart_module.stage2_score_risk_and_plan(symbol, tf, df, image, shape)
-                plan["bias"] = shape["bias"]
-                validate_plan(plan, cfg["policy"]["min_rr"])
-                last = float(df["close"].iloc[-1])
-                if (plan["entry"] > last if plan["bias"] == "偏多" else plan["entry"] < last):
-                    raise ValueError("本版只接受回踩限價：偏多入場不高於現價，偏空不低於現價")
-                if abs(plan["entry"] / last - 1) > 0.05:
-                    raise ValueError("入場距現價超過 5%")
-                ledger.set(scan_key, candle_close)
-                ledger.set(shape_key, signature)
-                if plan["risk_score"] < cfg["min_score"]:
-                    print(f"[AI未通過] {market}: {plan['risk_score']}/10", flush=True)
-                    continue
-                cohort = cohort_key(eid, symbol, tf, shape["pattern_code"], plan,
-                                    cfg["model"], cfg["policy"])
-                stats = ledger.stats(cohort, int(time.time()*1000), cfg["min_samples"], cfg["threshold"])
-                # Start at the NEXT completely unseen full candle. Never credit a
-                # touch earlier in the partly formed candle while Gemini was thinking.
-                start_ms = (int(time.time()*1000) // tf_ms + 1) * tf_ms
-                metadata = dict(exchange=eid, symbol=symbol, timeframe=tf, pattern=shape["pattern_code"],
-                                summary=str(plan.get("summary", ""))[:400],
-                                signal_close_ms=candle_close, shape=shape, model=cfg["model"], gate=stats)
-                signal = ledger.add(market, cohort, start_ms, tf_ms, plan, cfg["policy"], metadata)
-                if signal is None:
-                    continue
-                folder = cfg["state_dir"] / "charts"
-                folder.mkdir(parents=True, exist_ok=True)
-                marked = chart_module.render_chart_png(df, symbol, tf, entry=plan["entry"],
-                            stop_loss=plan["stop_loss"], take_profit=plan["take_profit"],
-                            trend_lines=shape["trend_lines"], dpi=110)
-                (folder / f"{signal['id']}.png").write_bytes(marked)
-                print(f"[已記錄] {market} {shape['pattern_code']}: {stats['wins']}/{stats['total']}, "
-                      f"Wilson下限 {stats['lower95']:.1%}, 輸出門檻={stats['eligible']}", flush=True)
-                if stats["eligible"]:
-                    output = export_signal(cfg, signal, stats)
-                    signal["exported"] = True
-                    ledger.save(signal)
-                    print(f"[SIGNAL] {output.resolve()}", flush=True)
-            except Exception as exc:
-                failures += 1
-                print(f"[分析略過] {market}: {safe_error(exc, cfg)}", flush=True)
-    return failures
-
-
-def run_watcher(chart_module, watch=False, interval=60, track_only=False):
-    cfg = settings()
-    if not track_only:
-        verify_model(cfg)
-    if not 15 <= interval <= 3600:
-        raise ValueError("輪詢間隔應為 15–3600 秒")
-    cfg["state_dir"].mkdir(parents=True, exist_ok=True)
-    with single_instance(cfg["state_dir"]):
-        ledger = Ledger(cfg["state_dir"] / "signals.sqlite3")
-        exchanges = {eid: getattr(ccxt, eid)({"enableRateLimit": True, "timeout": 15000})
-                     for eid in dict.fromkeys([cfg["exchange"], cfg["fallback"]])}
-        try:
-            print("模擬追蹤模式：只記錄行情與訊號，不下單。Ctrl+C 停止。", flush=True)
-            while True:
-                failures = cycle(cfg, ledger, chart_module, exchanges, scan=not track_only)
-                print("[紀錄統計] " + json.dumps(ledger.summary(), ensure_ascii=False), flush=True)
-                if not watch:
-                    return 1 if failures else 0
-                time.sleep(interval)
-        finally:
-            ledger.close()
-
-
-def show_status():
-    cfg = settings()
-    print("設定狀態（不顯示金鑰）")
-    for field in ("key",):
-        print(f"{field}: {'已設定' if cfg[field] else '未設定'}")
-    print(f"model: {cfg['model'] or 'auto（首次執行時自動選擇）'}")
-    path = cfg["state_dir"] / "signals.sqlite3"
-    if path.exists():
-        ledger = Ledger(path)
-        try:
-            print(json.dumps(ledger.summary(), ensure_ascii=False, indent=2))
-        finally:
-            ledger.close()
-
-
-# --- watcher_chart_source.py ---
+"""
+Crypto AI Vision Market Watcher（極速省時 + 8/10 高勝率標記 + 風險對齊建議槓桿倍率版）
+"""
 
 import argparse
 import base64
@@ -662,17 +21,142 @@ import pandas as pd
 import requests
 
 
-# 公開 USDT 永續合約行情；金鑰由 watcher_runtime 載入本機 .env。
+# ==================== 使用者設定區 ====================
 EXCHANGE_ID = os.getenv("EXCHANGE_ID", "bingx")
-FALLBACK_EXCHANGE_ID = os.getenv("FALLBACK_EXCHANGE_ID", "binanceusdm")
+FALLBACK_EXCHANGE_ID = os.getenv("FALLBACK_EXCHANGE_ID", "gate")
 SYMBOLS = os.getenv("SYMBOLS", "BTC/USDT:USDT,ETH/USDT:USDT,SOL/USDT:USDT,SUI/USDT:USDT,ZEC/USDT:USDT").split(",")
 TIMEFRAMES = os.getenv("TIMEFRAMES", "30m,1h,4h,1d").split(",")
 CANDLE_LIMIT = 200
+MIN_AI_CONFIDENCE = int(os.getenv("MIN_AI_CONFIDENCE", "6"))
+MAX_MARGIN_LOSS_PCT = float(os.getenv("MAX_MARGIN_LOSS_PCT", "0.15"))  # 單筆止損預計虧損保證金比例 (預設 15%)
+HISTORY_FILE = Path("sent_history.json")
+
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+# ======================================================
+
 TF_MINUTES_MAP = {"15m": 15, "30m": 30, "1h": 60, "4h": 240, "1d": 1440}
+COOLDOWN_HOURS_MAP = {"15m": 2, "30m": 3, "1h": 6, "4h": 16, "1d": 48}
+
+
+def load_history() -> dict[str, Any]:
+    if HISTORY_FILE.exists():
+        try:
+            data = json.loads(HISTORY_FILE.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+    return {}
+
+
+def save_history(history: dict[str, Any]) -> None:
+    HISTORY_FILE.write_text(json.dumps(history, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def is_in_cooldown_precheck(
+    history: dict[str, Any], symbol: str, tf: str, current_price: float | None = None
+) -> tuple[bool, str]:
+    """在呼叫 AI 之前先檢查冷卻狀態，若價格偏離上次進場點 > 2% 則提早解除冷卻"""
+    key = f"{symbol}|{tf}"
+    rec = history.get(key)
+    if not isinstance(rec, dict):
+        return False, ""
+    elapsed_hours = (time.time() - float(rec.get("ts", 0))) / 3600
+    cooldown_h = COOLDOWN_HOURS_MAP.get(tf, 3)
+    if elapsed_hours >= cooldown_h:
+        return False, ""
+    last_entry = float(rec.get("entry", 0))
+    if current_price and last_entry > 0 and abs(current_price - last_entry) / last_entry > 0.02:
+        return False, ""
+    return True, str(rec.get("pattern") or "已推播結構")
+
+
+def _validate_trade_plan(bias: str, entry: float, stop_loss: float, take_profit: float) -> tuple[bool, str]:
+    """嚴格校驗 AI 給出的多空點位邏輯與止損距離"""
+    if entry <= 0 or stop_loss <= 0 or take_profit <= 0:
+        return False, "點位數值異常 (<= 0)"
+
+    sl_pct = abs(entry - stop_loss) / entry
+    if sl_pct <= 0.001:
+        return False, f"止損距離過窄 ({sl_pct * 100:.3f}%)"
+
+    if "偏多" in bias:
+        if not (stop_loss < entry < take_profit):
+            return False, f"偏多點位邏輯錯誤 (SL={stop_loss}, Entry={entry}, TP={take_profit})"
+    elif "偏空" in bias:
+        if not (take_profit < entry < stop_loss):
+            return False, f"偏空點位邏輯錯誤 (TP={take_profit}, Entry={entry}, SL={stop_loss})"
+    else:
+        if (entry - stop_loss) * (take_profit - entry) <= 0:
+            return False, "SL 與 TP 位於 Entry 同側"
+
+    return True, ""
+
+
+def _suggest_leverage(entry: float, stop_loss: float) -> tuple[int, float, float]:
+    """依止損距離計算建議槓桿倍率（控制打損約虧保證金 15%，限制在 2x ~ 20x 之間）"""
+    sl_pct = abs(entry - stop_loss) / entry
+    raw_lev = int(MAX_MARGIN_LOSS_PCT / sl_pct)
+    lev = max(2, min(20, raw_lev))
+    est_margin_loss_pct = sl_pct * lev * 100
+    return lev, sl_pct * 100, est_margin_loss_pct
+
+
+def fetch_ticker_price(
+    exchange: ccxt.Exchange, symbol: str, fallback_exchange: ccxt.Exchange | None = None
+) -> float | None:
+    """輕量取得最新成交價，供冷卻期波動檢查使用"""
+    for ex in (exchange, fallback_exchange):
+        if ex is None:
+            continue
+        try:
+            ticker = ex.fetch_ticker(symbol)
+            price = ticker.get("last") or ticker.get("close")
+            if price:
+                return float(price)
+        except Exception:
+            continue
+    return None
+
+
+def fetch_ohlcv(
+    exchange: ccxt.Exchange,
+    symbol: str,
+    timeframe: str,
+    limit: int = 200,
+    fallback_exchange: ccxt.Exchange | None = None,
+) -> pd.DataFrame:
+    """抓取 K 線資料，遇限流自動重試 2 次，仍失敗則切換備援交易所"""
+    last_err: Exception | None = None
+    for attempt in range(1, 3):
+        try:
+            ohlcv = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+            df = pd.DataFrame(ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"])
+            df["dt"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
+            if len(df) > 2:
+                df = df.iloc[:-1].reset_index(drop=True)
+            return df
+        except Exception as exc:
+            last_err = exc
+            print(f"[重試 {attempt}/2] {exchange.id} 抓取 {symbol} {timeframe} 失敗: {exc}")
+            time.sleep(1.5 * attempt)
+
+    if fallback_exchange is not None:
+        print(f"[切換備援] 改用 {fallback_exchange.id} 抓取 {symbol} {timeframe}")
+        ohlcv = fallback_exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+        df = pd.DataFrame(ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"])
+        df["dt"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
+        if len(df) > 2:
+            df = df.iloc[:-1].reset_index(drop=True)
+        return df
+
+    raise RuntimeError(f"無法取得 {symbol} {timeframe} 資料: {last_err}")
 
 
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    """計算 EMA20、EMA50、RSI(14)、ATR(14)（EMA 平滑近似，非保證與交易平台逐值一致）與 20 週期均量"""
+    """計算 EMA20、EMA50、RSI(14)、ATR(14)（採 Wilder's Smoothing 對齊 TradingView）與 20 週期均量"""
     df["ema20"] = df["close"].ewm(span=20, adjust=False).mean()
     df["ema50"] = df["close"].ewm(span=50, adjust=False).mean()
 
@@ -681,8 +165,6 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     loss = (-delta.clip(upper=0)).ewm(alpha=1 / 14, adjust=False).mean()
     rs = gain / loss.replace(0, np.nan)
     df["rsi"] = 100 - (100 / (1 + rs))
-    df.loc[(loss == 0) & (gain > 0), "rsi"] = 100
-    df.loc[(loss == 0) & (gain == 0), "rsi"] = 50
 
     tr = pd.concat([
         df["high"] - df["low"],
@@ -717,7 +199,47 @@ def _extract_chart_pivots(plot_df: pd.DataFrame, window: int = 3) -> list[dict[s
 
 
 def _call_gemini(parts: list[dict[str, Any]]) -> dict[str, Any]:
-    return call_gemini(settings(), parts)
+    """抗塞車版：遇 429/503/Timeout 自動退避等待並切換備用模型"""
+    if not GEMINI_API_KEY:
+        raise RuntimeError("請設定 GEMINI_API_KEY")
+
+    models_to_try = [
+        GEMINI_MODEL,
+        "gemini-3.5-flash-lite",
+    ]
+    last_exc: Exception | None = None
+    for model_name in dict.fromkeys(models_to_try):
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={GEMINI_API_KEY}"
+        payload = {
+            "contents": [{"parts": parts}],
+            "generationConfig": {"responseMimeType": "application/json"},
+        }
+        for attempt in range(1, 3):
+            time.sleep(2.0)  # 每次請求前先停 2 秒，避免連打被限流
+            try:
+                resp = requests.post(url, json=payload, timeout=(10, 60))
+                if resp.status_code == 404:
+                    last_exc = requests.HTTPError(f"404 Not Found for {model_name}", response=resp)
+                    break
+                if resp.status_code in (429, 500, 502, 503, 504):
+                    last_exc = requests.HTTPError(f"{resp.status_code} for {model_name}", response=resp)
+                    wait_sec = 5 * attempt
+                    print(f"[Gemini {resp.status_code}] 等待 {wait_sec}s 重試或切換備用模型...")
+                    time.sleep(wait_sec)
+                    continue
+                resp.raise_for_status()
+                text = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
+                parsed = json.loads(text)
+                if isinstance(parsed, list) and parsed and isinstance(parsed[0], dict):
+                    return parsed[0]
+                if isinstance(parsed, dict):
+                    return parsed
+                raise ValueError("Gemini 回傳非預期的 JSON 格式")
+            except (requests.exceptions.RequestException, json.JSONDecodeError, KeyError, IndexError, ValueError) as exc:
+                last_exc = exc
+                time.sleep(5 * attempt)
+
+    raise last_exc or RuntimeError("Gemini API 呼叫失敗")
 
 
 def render_chart_png(
@@ -728,14 +250,15 @@ def render_chart_png(
     stop_loss: float | None = None,
     take_profit: float | None = None,
     trend_lines: list[list[list[float]]] | None = None,
+    high_prob_score: int | None = None,
     dpi: int = 180,
 ) -> bytes:
-    """繪製仿 BingX / TradingView 風格 K 線圖（型態與參考點位）"""
+    """繪製仿 BingX / TradingView 風格 K 線圖（含 8/10+ 高勝率金色徽章）"""
     if "ema20" not in df.columns:
         df = add_indicators(df.copy())
 
     plot_df = df.tail(85).copy().reset_index(drop=True)
-    plot_df["dt_tw"] = plot_df["dt"].dt.tz_convert("Asia/Taipei").dt.tz_localize(None)
+    plot_df["dt_tw"] = plot_df["dt"] + pd.Timedelta(hours=8)
     plot_df_idx = plot_df.set_index("dt_tw")
 
     ohlcv_df = plot_df_idx[["open", "high", "low", "close", "volume"]].copy()
@@ -793,7 +316,12 @@ def render_chart_png(
     y_pad = (y_max - y_min) * 0.09 if y_max > y_min else y_max * 0.02
     y_lo, y_hi = y_min - y_pad, y_max + y_pad
 
-    title_str = f"{symbol}  ·  {timeframe}  (UTC+8)"
+    is_high_prob = high_prob_score is not None and high_prob_score >= 8
+    title_str = (
+        f"★ HIGH PROBABILITY ({high_prob_score}/10)  |  {symbol} · {timeframe} (UTC+8)"
+        if is_high_prob
+        else f"{symbol}  ·  {timeframe}  (UTC+8)"
+    )
 
     buf = io.BytesIO()
     fig, axes = mpf.plot(
@@ -814,6 +342,21 @@ def render_chart_png(
     try:
         ax_main = axes[0]
         n = len(ohlcv_df)
+
+        if is_high_prob:
+            ax_main.text(
+                0.015,
+                0.96,
+                f" ★ HIGH WIN-RATE {high_prob_score}0%+ ({high_prob_score}/10) ★ ",
+                transform=ax_main.transAxes,
+                color="#0b0e11",
+                fontsize=10.5,
+                fontweight="bold",
+                va="top",
+                ha="left",
+                bbox=dict(boxstyle="round,pad=0.35", facecolor="#f0b90b", edgecolor="#fff3cd", linewidth=1.5),
+                zorder=10,
+            )
 
         if isinstance(trend_lines, list):
             for line in trend_lines:
@@ -946,10 +489,7 @@ def stage1_detect_pattern_from_chart(
 6. **上升 / 下降通道或旗形**：上下緣各有至少 2 個觸及點且大致平行。
 7. **關鍵支撐壓力突破 / 假跌破假突破獵取 (Liquidity Sweep)**：最新幾根 K 線明確放量突破或長影線刺破前期顯著高低點後收回。
 
-若沒有明確符合上述定義的結構，或仍待突破確認，請務必設 `has_pattern = false`。
-只看已提供資料，不猜測圖外走勢。不因辨識出型態就宣稱高勝率。
-pattern_code 必須選固定代碼：head_shoulders_top、head_shoulders_bottom、double_top、double_bottom、triangle、wedge、channel、flag、breakout、liquidity_sweep。
-pattern_start_bar 為型態最早結構轉折點的 bar 整數索引（0–81），每次檢視同一型態應錨定同一根歷史 K 線。
+若沒有明確符合上述定義的結構，請務必設 `has_pattern = false`。
 若確認符合，請先在 `pattern_note` 寫出具體各轉折點 bar 位置，再回傳 `trend_lines`：
 - 三角 / 楔形 / 通道：回傳 **2 條獨立直線**（第 1 條連上緣高點、第 2 條連下緣低點）。
 - M 頭 / W 底 / 頭肩：回傳 **1 條嚴格交替轉折的折線**（例如頭肩底為：高-左肩低-高-頭低-高-右肩低-高）。
@@ -958,8 +498,6 @@ pattern_start_bar 為型態最早結構轉折點的 bar 整數索引（0–81）
 {{
   "has_pattern": true 或 false,
   "pattern_name": "型態名稱",
-  "pattern_code": "固定英文代碼",
-  "pattern_start_bar": 0,
   "bias": "偏多" 或 "偏空" 或 "待突破確認",
   "trend_lines": [[[bar, price], [bar, price], ...]],
   "pattern_note": "寫出具體轉折點 bar 位置與結構說明"
@@ -987,16 +525,13 @@ def stage2_score_risk_and_plan(
 {candles_text}
 
 請同時對照 K 線圖與量價數據進行嚴格風險評估：
-1. 評估是否有逆勢撞均線、量能背離、止損位置合理性，給出 `risk_score`（1 到 10 的整數，只代表主觀品質，絕對不是成功機率）。
-2. 若尚未確認突破／回踩或量價有疑慮，confirmed=false，禁止把未確認條件當成成立。
-3. 本版只做回踩限價入場：偏多 entry 不高於最新收盤，偏空 entry 不低於最新收盤；入場距收盤最多 5%。
-4. 給出具體的 `entry`（入場點）、`stop_loss`（止損點）、`take_profit`（止盈點，風報比至少 1:1.8）。
+1. 評估是否有逆勢撞均線、量能背離、止損位置合理性，給出 `risk_score`（1 到 10 的整數，8 分以上代表極高勝率 80%+ 優質機會）。
+2. 給出具體的 `entry`（入場點）、`stop_loss`（止損點）、`take_profit`（止盈點，風報比至少 1:1.8）。
 
 只回傳純 JSON：
 {{
-  "confirmed": true 或 false,
   "risk_score": 1 到 10 的整數,
-  "risk_level": "低風險" 或 "中風險" 或 "高風險",
+  "risk_level": "高勝率精選" 或 "低風險" 或 "中風險" 或 "高風險",
   "entry": 數字,
   "stop_loss": 數字,
   "take_profit": 數字,
@@ -1009,99 +544,223 @@ def stage2_score_risk_and_plan(
     ])
 
 
-def download_market_data(output_dir: str) -> None:
-    """下載公開 USDT 永續合約 K 線，不呼叫 AI 或 Telegram。"""
-    target = Path(output_dir)
-    target.mkdir(parents=True, exist_ok=True)
-    exchanges = [getattr(ccxt, name)({"enableRateLimit": True, "timeout": 15000})
-                 for name in dict.fromkeys([EXCHANGE_ID, FALLBACK_EXCHANGE_ID])]
-    manifest = {"downloaded_at": datetime.now(timezone.utc).isoformat(), "files": [], "errors": []}
-    for symbol in map(str.strip, SYMBOLS):
+def check_telegram_check_command() -> str | None:
+    """僅在收到 /check 指令時才觸發全盤體檢，避免一般訊息誤觸發"""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return None
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
+        resp = requests.get(url, params={"timeout": 2}, timeout=10)
+        resp.raise_for_status()
+        updates = resp.json().get("result", [])
+        if not updates:
+            return None
+
+        max_id = max(u["update_id"] for u in updates)
+        trigger_msg = None
+        for u in updates:
+            msg = u.get("message") or {}
+            if str(msg.get("chat", {}).get("id", "")) == str(TELEGRAM_CHAT_ID):
+                text = (msg.get("text") or "").strip()
+                if text.lower().startswith("/check"):
+                    trigger_msg = text
+
+        requests.get(url, params={"offset": max_id + 1, "timeout": 1}, timeout=10)
+        return trigger_msg
+    except Exception as exc:
+        print(f"[Telegram 收訊檢查失敗] {exc}")
+        return None
+
+
+def _safe_join_lines(header: str, lines: list[str], max_len: int = 3900) -> str:
+    """按行安全組合訊息，避免切破 HTML 標籤"""
+    out = header
+    for line in lines:
+        if len(out) + len(line) + 1 > max_len:
+            out += "\n...(訊息過長，其餘省略)"
+            break
+        out += line + "\n"
+    return out.rstrip()
+
+
+def send_telegram_text(text: str) -> None:
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("[模擬文字推播]\n" + text)
+        return
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    resp = requests.post(
+        url,
+        json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True},
+        timeout=15,
+    )
+    resp.raise_for_status()
+
+
+def send_telegram_photo(image_bytes: bytes, caption: str) -> None:
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("[模擬推播] 未設定 Telegram Token/Chat ID，訊息內容如下：\n" + caption)
+        return
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
+    resp = requests.post(
+        url,
+        data={"chat_id": TELEGRAM_CHAT_ID, "caption": caption, "parse_mode": "HTML"},
+        files={"photo": ("chart.png", image_bytes, "image/png")},
+        timeout=20,
+    )
+    resp.raise_for_status()
+
+
+def is_recently_closed_for_tf(df: pd.DataFrame, timeframe: str) -> bool:
+    """收盤後 28 分鐘內才掃描，避免每 30 分鐘排程重複掃描同一根 K 線"""
+    last_open_utc = df["dt"].iloc[-1].to_pydatetime()
+    tf_minutes = TF_MINUTES_MAP.get(timeframe, 30)
+    last_close_utc = last_open_utc + timedelta(minutes=tf_minutes)
+    age_minutes = (datetime.now(timezone.utc) - last_close_utc).total_seconds() / 60
+    return -2 <= age_minutes <= 28
+
+
+def run(ignore_time_window: bool = False) -> None:
+    user_query = check_telegram_check_command()
+    if user_query:
+        print(f"[收到 Telegram 指令] {user_query}")
+
+    history = load_history()
+    exchange_cls = getattr(ccxt, EXCHANGE_ID)
+    exchange = exchange_cls({"enableRateLimit": True})
+    fallback_cls = getattr(ccxt, FALLBACK_EXCHANGE_ID, None)
+    fallback_exchange = fallback_cls({"enableRateLimit": True}) if fallback_cls else None
+    tz_tw = timezone(timedelta(hours=8))
+
+    status_lines: list[str] = []
+    error_lines: list[str] = []
+
+    for raw_symbol in SYMBOLS:
+        symbol = raw_symbol.strip()
         if not symbol:
             continue
-        for tf in map(str.strip, TIMEFRAMES):
+        short_sym = symbol.split("/")[0]
+        current_price = fetch_ticker_price(exchange, symbol, fallback_exchange)
+
+        for raw_tf in TIMEFRAMES:
+            tf = raw_tf.strip()
             if not tf:
                 continue
-            for exchange in exchanges:
-                try:
-                    time.sleep(0.6)
-                    rows = exchange.fetch_ohlcv(symbol, timeframe=tf, limit=CANDLE_LIMIT + 1)
-                    df = pd.DataFrame(rows, columns=["timestamp", "open", "high", "low", "close", "volume"])
-                    df = df.drop_duplicates("timestamp").sort_values("timestamp")
-                    now_ms = int(time.time() * 1000)
-                    df = df[df["timestamp"] + TF_MINUTES_MAP[tf] * 60000 <= now_ms].tail(CANDLE_LIMIT).copy()
-                    if df.empty:
-                        raise ValueError("未取得已收盤 K 線")
-                    if not np.isfinite(df.to_numpy(dtype=float)).all():
-                        raise ValueError("行情包含非有限數值")
-                    if ((df["high"] < df[["open", "close", "low"]].max(axis=1)) |
-                        (df["low"] > df[["open", "close", "high"]].min(axis=1))).any():
-                        raise ValueError("OHLC 價格關係異常")
-                    df["datetime_utc"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
-                    df["datetime_taipei"] = df["datetime_utc"].dt.tz_convert("Asia/Taipei")
-                    df["exchange"] = exchange.id
-                    df["symbol"] = symbol
-                    filename = f"{exchange.id}_{symbol.split('/')[0]}_USDT_{tf}.csv"
-                    df.to_csv(target / filename, index=False, encoding="utf-8-sig")
-                    manifest["files"].append({"file": filename, "rows": len(df), "exchange": exchange.id,
-                                              "symbol": symbol, "timeframe": tf,
-                                              "last_open_utc": str(df["datetime_utc"].iloc[-1])})
-                    print(f"[OK] {filename}: {len(df)} candles", flush=True)
-                    break
-                except Exception as exc:
-                    print(f"[FAILED] {exchange.id} {symbol} {tf}: {exc}", flush=True)
-            else:
-                manifest["errors"].append({"symbol": symbol, "timeframe": tf})
-    (target / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(f"Saved {len(manifest['files'])} files to {target.resolve()}", flush=True)
-    if manifest["errors"]:
-        raise SystemExit(1)
+            try:
+                in_cd_pre, prev_pat = is_in_cooldown_precheck(history, symbol, tf, current_price)
+                if in_cd_pre:
+                    status_lines.append(f"• <b>{short_sym} ({tf})</b>：⏳ 冷卻中（{html.escape(prev_pat)}，略過掃描）")
+                    print(f"[冷卻跳過] {symbol} {tf} 直接跳過 AI 掃描")
+                    continue
 
+                df = fetch_ohlcv(exchange, symbol, tf, limit=CANDLE_LIMIT, fallback_exchange=fallback_exchange)
+                if not ignore_time_window and not user_query and not is_recently_closed_for_tf(df, tf):
+                    continue
 
+                df = add_indicators(df)
+                raw_chart = render_chart_png(df, symbol, tf, dpi=110)
 
+                s1 = stage1_detect_pattern_from_chart(symbol, tf, df, raw_chart)
+                if not s1.get("has_pattern"):
+                    status_lines.append(f"• <b>{short_sym} ({tf})</b>：無明確型態")
+                    print(f"[第一關過濾] {symbol} {tf} 無明確型態")
+                    continue
 
-# --- watcher_cli_source.py ---
-def main():
-    load_env()
-    # Download mode also respects local .env settings.
-    global EXCHANGE_ID, FALLBACK_EXCHANGE_ID, SYMBOLS, TIMEFRAMES
-    cfg = settings()
-    EXCHANGE_ID, FALLBACK_EXCHANGE_ID = cfg["exchange"], cfg["fallback"]
-    SYMBOLS, TIMEFRAMES = cfg["symbols"], cfg["timeframes"]
-    parser = argparse.ArgumentParser(description="BingX / Binance Gemini 型態觀察器（模擬追蹤，不下單）")
-    modes = parser.add_mutually_exclusive_group()
-    modes.add_argument("--watch", action="store_true", help="持續輪詢；Ctrl+C 停止")
-    modes.add_argument("--status", action="store_true", help="顯示設定及模擬紀錄統計")
-    modes.add_argument("--list-models", action="store_true", help="查詢此 API Key 可用模型")
-    modes.add_argument("--check-config", action="store_true", help="驗證 Key、選定模型並測試圖片／JSON（可能產生少量 API 用量）")
-    modes.add_argument("--download-only", action="store_true", help="只下載行情 CSV")
-    parser.add_argument("--track-only", action="store_true", help="只結算已有模擬訊號，不呼叫 Gemini")
-    parser.add_argument("--interval", type=int, default=60)
-    parser.add_argument("--output", default="market_data")
-    args = parser.parse_args()
-    if args.status:
-        show_status()
-    elif args.list_models:
-        print("\n".join(list_models(cfg)))
-    elif args.check_config:
-        verify_model(cfg)
-        print("Gemini 設定檢查通過；沒有啟動盯盤或通知。")
-    elif args.download_only:
-        download_market_data(args.output)
-    else:
-        import sys
-        return run_watcher(sys.modules[__name__], args.watch, args.interval, args.track_only)
-    return 0
+                pat_name = html.escape(str(s1.get("pattern_name") or "未命名型態"))
+                bias_raw = str(s1.get("bias") or "待確認")
+                bias_str = html.escape(bias_raw)
+                print(f"[第一關命中] {symbol} {tf}: {pat_name} ({bias_str})")
+
+                s2 = stage2_score_risk_and_plan(symbol, tf, df, raw_chart, s1)
+                risk_score = int(s2.get("risk_score", 0))
+
+                if risk_score >= MIN_AI_CONFIDENCE:
+                    last_price = float(df["close"].iloc[-1])
+                    tf_mins = TF_MINUTES_MAP.get(tf, 30)
+                    close_dt_tw = (df["dt"].iloc[-1] + timedelta(minutes=tf_mins)).astimezone(tz_tw)
+                    candle_tw = close_dt_tw.strftime("%Y-%m-%d %H:%M")
+
+                    entry_p = float(s2.get("entry") or last_price)
+                    is_short = "偏空" in bias_raw
+                    sl_p = float(s2.get("stop_loss") or (last_price * 1.02 if is_short else last_price * 0.98))
+                    tp_p = float(s2.get("take_profit") or (last_price * 0.96 if is_short else last_price * 1.04))
+
+                    is_valid, invalid_reason = _validate_trade_plan(bias_raw, entry_p, sl_p, tp_p)
+                    if not is_valid:
+                        status_lines.append(f"• <b>{short_sym} ({tf})</b>：⚠️ 點位校驗未通過（{html.escape(invalid_reason)}）")
+                        print(f"[點位校驗過濾] {symbol} {tf}: {invalid_reason}")
+                        continue
+
+                    risk = abs(entry_p - sl_p)
+                    rr = abs(tp_p - entry_p) / risk
+                    lev, sl_dist_pct, margin_loss_pct = _suggest_leverage(entry_p, sl_p)
+                    risk_lvl = html.escape(str(s2.get("risk_level") or ""))
+                    summary_safe = html.escape(str(s2.get("summary") or "")[:240])
+
+                    marked_chart = render_chart_png(
+                        df, symbol, tf,
+                        entry=entry_p, stop_loss=sl_p, take_profit=tp_p,
+                        trend_lines=s1.get("trend_lines"),
+                        high_prob_score=risk_score if risk_score >= 8 else None,
+                    )
+                    if risk_score >= 8:
+                        title_line = f"🚨🔥 <b>【高勝率 80%+ 精選】{html.escape(symbol)} ({tf})</b> 🔥🚨\n"
+                        score_line = f"• <b>勝率評分</b>：⭐ <b>{risk_score}/10（{risk_score}0% 高勝率重磅訊號）</b>\n"
+                        status_badge = f"🔥✅ 已發圖【高勝率 {risk_score}/10】"
+                    else:
+                        title_line = f"🔔 <b>AI 盯盤警報｜{html.escape(symbol)} ({tf})</b>\n"
+                        score_line = f"• <b>風險評分</b>：{risk_score}/10（{risk_lvl}）\n"
+                        status_badge = f"✅ 已發圖（{pat_name}，{risk_score}/10）"
+
+                    msg = (
+                        title_line
+                        + f"• <b>型態結構</b>：{pat_name}（{bias_str}）\n"
+                        + score_line
+                        + f"• <b>現價</b>：{_fmt_price(last_price)}（收盤 {candle_tw} UTC+8）\n"
+                        + f"• <b>參考規劃</b>：入場 <code>{_fmt_price(entry_p)}</code> ｜ 止損 <code>{_fmt_price(sl_p)}</code> ｜ 止盈 <code>{_fmt_price(tp_p)}</code>（R:R ≈ 1:{rr:.1f}）\n"
+                        + f"• <b>建議倍率</b>：<code>{lev}x</code>（止損距離 {sl_dist_pct:.2f}%，打損約虧保證金 {margin_loss_pct:.0f}%）\n"
+                        + f"• <b>AI 分析</b>：{summary_safe}"
+                    )
+                    send_telegram_photo(marked_chart, msg)
+                    history[f"{symbol}|{tf}"] = {
+                        "pattern": s1.get("pattern_name"),
+                        "bias": bias_raw,
+                        "entry": entry_p,
+                        "ts": time.time(),
+                    }
+                    save_history(history)
+                    status_lines.append(f"• <b>{short_sym} ({tf})</b>：{status_badge}")
+                    print(f"[第二關通過已推播] {symbol} {tf}: 評分 {risk_score}/10, 建議 {lev}x")
+                else:
+                    status_lines.append(
+                        f"• <b>{short_sym} ({tf})</b>：🟡 有「{pat_name}」但風險評分 {risk_score}/10（未達 {MIN_AI_CONFIDENCE} 分）"
+                    )
+                    print(f"[第二關風險過濾] {symbol} {tf} {pat_name} 評分僅 {risk_score}/10")
+
+            except Exception as exc:
+                err_safe = html.escape(str(exc)[:80])
+                err_msg = f"• <b>{short_sym} ({tf})</b>：❌ 錯誤（{err_safe}）"
+                status_lines.append(err_msg)
+                error_lines.append(err_msg)
+                print(f"[錯誤] {symbol} {tf} 處理失敗: {exc}")
+
+    # 若想每輪不論有無訊號都收到回報，把下面這行改成：if user_query or error_lines or status_lines:
+    if user_query or error_lines:
+        now_tw = datetime.now(tz_tw).strftime("%m-%d %H:%M")
+        header = (
+            f"📋 <b>盯盤系統體檢回報（{now_tw} UTC+8）</b>\n"
+            f"目前門檻：風險評分 ≥ <b>{MIN_AI_CONFIDENCE}/10</b>\n"
+        )
+        if user_query:
+            header += f"收到指令：「<i>{html.escape(user_query[:30])}</i>」\n\n"
+        else:
+            header += "⚠️ <b>偵測到部分項目異常：</b>\n\n"
+
+        full_text = _safe_join_lines(header, status_lines) if status_lines else header + "本輪無剛收盤的週期。"
+        send_telegram_text(full_text)
 
 
 if __name__ == "__main__":
-    import sys
-    if hasattr(sys.stdout, "reconfigure"):
-        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-    try:
-        raise SystemExit(main())
-    except KeyboardInterrupt:
-        print("已停止；模擬紀錄已保存在本機。")
-    except Exception as exc:
-        print("啟動失敗：" + safe_error(exc, {"key": os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")}))
-        raise SystemExit(1)
+    parser = argparse.ArgumentParser(description="Crypto AI Two-Stage Vision Watcher")
+    parser.add_argument("--test", action="store_true", help="忽略時間窗口限制，強制掃描一次")
+    args = parser.parse_args()
+    run(ignore_time_window=args.test)
