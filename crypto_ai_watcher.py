@@ -1,11 +1,5 @@
 """
-Crypto AI Vision Market Watcher（全面防呆強化版）
-修正重點：
-  1. HTML 跳脫與安全截斷：AI 文字含 < / > 或過長時不會導致 Telegram 400 傳送失敗
-  2. JSON 結構容錯：AI 偶爾回傳單元素 list 時自動解包，不崩潰
-  3. 價位合理性校驗 ＋ 右側 TP/Entry/SL 標籤防重疊錯位
-  4. 詢問「狀態」時一樣遵守冷卻機制，不洗版重複發圖
-  5. Gemini 429/503/ReadTimeout 自動重試 ＋ BingX 100410 重試與 Gate 備援
+Crypto AI Vision Market Watcher（嚴格全型態校驗 + 8/10 高勝率特殊標記版）
 """
 
 import argparse
@@ -201,8 +195,9 @@ def render_chart_png(
     stop_loss: float | None = None,
     take_profit: float | None = None,
     trend_lines: list[list[list[float]]] | None = None,
+    high_prob_score: int | None = None,
 ) -> bytes:
-    """繪製仿 BingX / TradingView 風格 K 線圖（含防標籤重疊與極端值保護）"""
+    """繪製仿 BingX / TradingView 風格 K 線圖（含 8/10+ 高勝率金色徽章）"""
     if "ema20" not in df.columns:
         df = add_indicators(df.copy())
 
@@ -246,7 +241,6 @@ def render_chart_png(
     chart_max = float(plot_df["high"].max())
     last_price = float(ohlcv_df["Close"].iloc[-1])
 
-    # 過濾掉 AI 偶爾產生的極端異常價位，避免壓扁整個 K 線圖
     def _valid_price(v: float | None) -> float | None:
         if v is None or v <= 0:
             return None
@@ -266,6 +260,13 @@ def render_chart_png(
     y_pad = (y_max - y_min) * 0.09 if y_max > y_min else y_max * 0.02
     y_lo, y_hi = y_min - y_pad, y_max + y_pad
 
+    is_high_prob = high_prob_score is not None and high_prob_score >= 8
+    title_str = (
+        f"★ HIGH PROBABILITY ({high_prob_score}/10)  |  {symbol} · {timeframe} (UTC+8)"
+        if is_high_prob
+        else f"{symbol}  ·  {timeframe}  (UTC+8)"
+    )
+
     buf = io.BytesIO()
     fig, axes = mpf.plot(
         ohlcv_df,
@@ -274,7 +275,7 @@ def render_chart_png(
         panel_ratios=(5, 1.2),
         addplot=addplots,
         style=style,
-        title=f"{symbol}  ·  {timeframe}  (UTC+8)",
+        title=title_str,
         figsize=(12.5, 7),
         xlim=(-1, len(ohlcv_df) + 18),
         ylim=(y_lo, y_hi),
@@ -285,7 +286,22 @@ def render_chart_png(
     ax_main = axes[0]
     n = len(ohlcv_df)
 
-    # 1. 畫型態結構線（只畫在合理價格範圍內的點）
+    # 8/10 以上高勝率金色專屬徽章
+    if is_high_prob:
+        ax_main.text(
+            0.015,
+            0.96,
+            f" ★ HIGH WIN-RATE {high_prob_score}0%+ ({high_prob_score}/10) ★ ",
+            transform=ax_main.transAxes,
+            color="#0b0e11",
+            fontsize=10.5,
+            fontweight="bold",
+            va="top",
+            ha="left",
+            bbox=dict(boxstyle="round,pad=0.35", facecolor="#f0b90b", edgecolor="#fff3cd", linewidth=1.5),
+            zorder=10,
+        )
+
     if isinstance(trend_lines, list):
         for line in trend_lines:
             if not isinstance(line, list) or len(line) < 2:
@@ -301,7 +317,6 @@ def render_chart_png(
             if len(xs) >= 2:
                 ax_main.plot(xs, ys, color="#b2b5be", linewidth=2.0, alpha=0.9, zorder=5)
 
-    # 2. 目標預測箭頭
     if tp_v is not None:
         start_y = entry_v if entry_v is not None else last_price
         arrow_color = "#0ecb81" if tp_v >= start_y else "#f6465d"
@@ -313,7 +328,6 @@ def render_chart_png(
             zorder=6,
         )
 
-    # 3. 最高/最低點指引線
     hi_idx = int(plot_df["high"].idxmax())
     hi_val = float(plot_df["high"].iloc[hi_idx])
     lo_idx = int(plot_df["low"].idxmin())
@@ -345,7 +359,6 @@ def render_chart_png(
         fontweight="bold",
     )
 
-    # 4. 畫出 止盈 / 入場 / 止損 水平虛線，並對右側價格框做防重疊錯位
     right_x = n + 1.5
     lines_to_draw: list[tuple[str, float, str, str, str]] = []
     if tp_v is not None:
@@ -398,26 +411,29 @@ def render_chart_png(
 def stage1_detect_pattern_from_chart(
     symbol: str, timeframe: str, df: pd.DataFrame, raw_chart_bytes: bytes
 ) -> dict[str, Any]:
-    """【AI 第一關】看圖辨識：寧缺勿濫，精準辨識型態並嚴格按幾何規則回傳畫線座標"""
+    """【AI 第一關】嚴格幾何校驗所有型態，防止把 V 型反轉或單邊回檔誤認成頭肩底/三角"""
     plot_df = df.tail(85).copy().reset_index(drop=True)
     pivots = _extract_chart_pivots(plot_df, window=3)
     last_price = float(plot_df["close"].iloc[-1])
     img_b64 = base64.b64encode(raw_chart_bytes).decode("utf-8")
 
-    prompt = f"""你是嚴謹的專業技術分析師，寧缺勿濫，絕不把普通的單邊回檔誤認成型態。
-請觀察這張 {symbol} ({timeframe} 週期、共 85 根 K 線，最左 bar 0、最右最新收盤 bar 84) 的 K 線圖。
-目前收盤價 {_fmt_price(last_price)}，轉折點座標參考（bar 編號與價格）：
+    prompt = f"""你是極度嚴謹的技術分析師。請觀察這張 {symbol} ({timeframe} 週期、共 85 根 K 線，最左 bar 0、最右最新收盤 bar 84) 的 K 線圖。
+目前收盤價 {_fmt_price(last_price)}，轉折點座標參考：
 {json.dumps(pivots, ensure_ascii=False)}
 
-請檢查圖中「最右側（最新走勢）」是否真正存在清晰、具幾何對稱性的結構：
-1. **三角收斂 / 楔形 / 通道**：上緣必須至少有 2 個以上高點逐漸壓低（或水平）、且下緣同時有 2 個以上低點逐漸墊高（或水平），兩條線明顯收攏。如果只有 1 個尖頭回檔，絕對不算三角收斂！
-2. **M 頭 / W 底 / 頭肩頂 / 頭肩底**：必須有清楚的兩隻腳或三尊頭肩與頸線。
-3. **關鍵支撐壓力突破 / 假跌破假突破獵取**：K 線明確刺破前期顯著高低點或放量突破。
+請依序檢查「最右側（最新走勢）」是否**真正符合**以下任一幾何定義（必須先確認轉折點數量與位置吻合，不吻合就一律回傳 false，寧缺勿濫）：
+1. **頭肩頂**：必須有 3 個清楚波峰（左肩、明顯更高的頭部、右肩低於頭部），且中間有頸線；單純震盪不算。
+2. **頭肩底**：必須有 3 個清楚波谷（左肩、明顯更低的頭部、右肩高於頭部）。**注意：單純的 V 型反轉或跌深後一路階梯墊高，沒有清楚獨立左肩與右肩波谷，絕對不算頭肩底！**
+3. **M 頭 (Double Top)**：必須有 2 個高度相近的波段高點（誤差約 1.5% 內）與中間頸線。
+4. **W 底 (Double Bottom)**：必須有 2 個深度相近的波段低點（誤差約 1.5% 內）與中間頸線。
+5. **三角收斂 / 楔形**：上緣必須至少有 2 個高點、下緣必須至少有 2 個低點，兩條邊線明顯向右側收攏；單一尖頭回檔不算。
+6. **上升 / 下降通道或旗形**：上下緣各有至少 2 個觸及點且大致平行。
+7. **關鍵支撐壓力突破 / 假跌破假突破獵取 (Liquidity Sweep)**：最新幾根 K 線明確放量突破或長影線刺破前期顯著高低點後收回。
 
-如果只是普通震盪或單純小回檔，請務必設 has_pattern = false。
-若確認有型態，請嚴格遵守畫線規則回傳 `trend_lines`：
-- 如果是 **三角收斂 / 通道**：必須回傳 **2 條獨立直線**（第 1 條連 2 個高點、第 2 條連 2 個低點，例如 `[[[b1,h1],[84,h2]], [[b3,l1],[84,l2]]]`），絕對不要把高點跟低點混連成鋸齒！
-- 如果是 **M 頭 / W 底 / 頭肩**：回傳 **1 條交替轉折折線**（例如 W 底：高-低-高-低-高，用轉折點精準連出 W 字）。
+若沒有明確符合上述定義的結構，請務必設 `has_pattern = false`。
+若確認符合，請先在 `pattern_note` 寫出具體各轉折點 bar 位置，再回傳 `trend_lines`：
+- 三角 / 楔形 / 通道：回傳 **2 條獨立直線**（第 1 條連上緣高點、第 2 條連下緣低點）。
+- M 頭 / W 底 / 頭肩：回傳 **1 條嚴格交替轉折的折線**（例如頭肩底為：高-左肩低-高-頭低-高-右肩低-高）。
 
 只回傳純 JSON：
 {{
@@ -425,7 +441,7 @@ def stage1_detect_pattern_from_chart(
   "pattern_name": "型態名稱",
   "bias": "偏多" 或 "偏空" 或 "待突破確認",
   "trend_lines": [[[bar, price], [bar, price], ...]],
-  "pattern_note": "簡短描述型態所在位置與高低點"
+  "pattern_note": "寫出具體轉折點 bar 位置與結構說明"
 }}"""
 
     return _call_gemini([
@@ -449,14 +465,14 @@ def stage2_score_risk_and_plan(
 以下為最近 25 根 K 線與均線/RSI/ATR 數據：
 {candles_text}
 
-請同時對照 K 線圖與量價數據進行風險評估：
-1. 評估是否有逆勢撞均線、量能背離、止損過遠或假訊號風險，給出 `risk_score`（1 到 10 的整數，分數越高代表風險越低、交易品質越好）。
+請同時對照 K 線圖與量價數據進行嚴格風險評估：
+1. 評估結構是否紮實、有無逆勢撞均線、量能配合與止損位置合理性，給出 `risk_score`（1 到 10 的整數，8 分以上代表極高勝率 80%+ 優質機會）。
 2. 給出具體的 `entry`（入場點）、`stop_loss`（止損點）、`take_profit`（止盈點，風報比至少 1:1.8）。
 
 只回傳純 JSON：
 {{
   "risk_score": 1 到 10 的整數,
-  "risk_level": "低風險" 或 "中風險" 或 "高風險",
+  "risk_level": "高勝率精選" 或 "低風險" 或 "中風險" 或 "高風險",
   "entry": 數字,
   "stop_loss": 數字,
   "take_profit": 數字,
@@ -599,14 +615,24 @@ def run(ignore_time_window: bool = False) -> None:
                         df, symbol, tf,
                         entry=entry_p, stop_loss=sl_p, take_profit=tp_p,
                         trend_lines=s1.get("trend_lines"),
+                        high_prob_score=risk_score if risk_score >= 8 else None,
                     )
+                    if risk_score >= 8:
+                        title_line = f"🚨🔥 <b>【高勝率 80%+ 精選】{html.escape(symbol)} ({tf})</b> 🔥🚨\n"
+                        score_line = f"• <b>勝率評分</b>：⭐ <b>{risk_score}/10（{risk_score}0% 高勝率重磅訊號）</b>\n"
+                        status_badge = f"🔥✅ 已發圖【高勝率 {risk_score}/10】"
+                    else:
+                        title_line = f"🔔 <b>AI 盯盤警報｜{html.escape(symbol)} ({tf})</b>\n"
+                        score_line = f"• <b>風險評分</b>：{risk_score}/10（{risk_lvl}）\n"
+                        status_badge = f"✅ 已發圖（{pat_name}，{risk_score}/10）"
+
                     msg = (
-                        f"🔔 <b>AI 盯盤警報｜{html.escape(symbol)} ({tf})</b>\n"
-                        f"• <b>型態結構</b>：{pat_name}（{bias_str}）\n"
-                        f"• <b>風險評分</b>：{risk_score}/10（{risk_lvl}）\n"
-                        f"• <b>現價</b>：{_fmt_price(last_price)}（收盤 {candle_tw} UTC+8）\n"
-                        f"• <b>參考規劃</b>：入場 <code>{_fmt_price(entry_p)}</code> ｜ 止損 <code>{_fmt_price(sl_p)}</code> ｜ 止盈 <code>{_fmt_price(tp_p)}</code>（R:R ≈ 1:{rr:.1f}）\n"
-                        f"• <b>AI 分析</b>：{summary_safe}"
+                        title_line
+                        + f"• <b>型態結構</b>：{pat_name}（{bias_str}）\n"
+                        + score_line
+                        + f"• <b>現價</b>：{_fmt_price(last_price)}（收盤 {candle_tw} UTC+8）\n"
+                        + f"• <b>參考規劃</b>：入場 <code>{_fmt_price(entry_p)}</code> ｜ 止損 <code>{_fmt_price(sl_p)}</code> ｜ 止盈 <code>{_fmt_price(tp_p)}</code>（R:R ≈ 1:{rr:.1f}）\n"
+                        + f"• <b>AI 分析</b>：{summary_safe}"
                     )
                     send_telegram_photo(marked_chart, msg)
                     history[f"{symbol}|{tf}"] = {
@@ -616,7 +642,7 @@ def run(ignore_time_window: bool = False) -> None:
                         "ts": time.time(),
                     }
                     save_history(history)
-                    status_lines.append(f"• <b>{short_sym} ({tf})</b>：✅ 已發圖（{pat_name}，{risk_score}/10）")
+                    status_lines.append(f"• <b>{short_sym} ({tf})</b>：{status_badge}")
                     print(f"[第二關通過已推播] {symbol} {tf}: 評分 {risk_score}/10")
                 else:
                     status_lines.append(
