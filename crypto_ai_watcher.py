@@ -1,10 +1,10 @@
 """
-Crypto AI Vision Market Watcher (Gemini 2.5 Flash 看圖盯盤 + 趨勢折線/箭頭繪製 + 抗限流版)
+Crypto AI Vision Market Watcher (高靈敏度 AI 看圖盯盤 + 趨勢折線/箭頭繪製 + 抗限流版)
 流程：
   1. 每 30 分鐘由 cron-job.org 準時觸發，抓取 30m / 1h / 4h / 1d 剛收盤的 K 線
   2. 內建 BingX 限流 (100410) 自動重試 3 次＋Gate 備援，確保不漏抓任何幣種
-  3. 直接繪製高清晰度 BingX 風格 K 線圖並交給 Gemini Vision 看圖辨識
-  4. 若有明確型態，Gemini 直接標出型態折線座標、入場 / 止損 / 止盈與目標箭頭，畫在圖上推播至 Telegram
+  3. 直接繪製高清晰度 BingX 風格 K 線圖並交給 Gemini Vision 積極辨識型態與結構
+  4. 只要出現收斂、通道、旗形、M頭/W底、頭肩、突破或長影線反轉，即標出趨勢線與入場/止損/止盈推播至 Telegram
 """
 
 import argparse
@@ -29,7 +29,7 @@ FALLBACK_EXCHANGE_ID = os.getenv("FALLBACK_EXCHANGE_ID", "gate")
 SYMBOLS = os.getenv("SYMBOLS", "BTC/USDT:USDT,ETH/USDT:USDT,SOL/USDT:USDT,SUI/USDT:USDT,ZEC/USDT:USDT").split(",")
 TIMEFRAMES = os.getenv("TIMEFRAMES", "30m,1h,4h,1d").split(",")
 CANDLE_LIMIT = 200
-MIN_AI_CONFIDENCE = int(os.getenv("MIN_AI_CONFIDENCE", "7"))
+MIN_AI_CONFIDENCE = int(os.getenv("MIN_AI_CONFIDENCE", "5"))
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
@@ -185,7 +185,6 @@ def render_chart_png(
     ax_main = axes[0]
     n = len(ohlcv_df)
 
-    # 1. 畫出型態趨勢折線（如 M 頭、W 底、三角收斂上下緣）
     if trend_lines:
         for line in trend_lines:
             if not isinstance(line, list) or len(line) < 2:
@@ -202,7 +201,6 @@ def render_chart_png(
             if len(xs) >= 2:
                 ax_main.plot(xs, ys, color="#b2b5be", linewidth=2.0, alpha=0.9, zorder=5)
 
-    # 2. 畫出從現價/入場指向止盈目標的預測趨勢箭頭
     if take_profit and take_profit > 0:
         start_y = float(entry) if entry and entry > 0 else last_price
         arrow_color = "#0ecb81" if float(take_profit) >= start_y else "#f6465d"
@@ -214,7 +212,6 @@ def render_chart_png(
             zorder=6,
         )
 
-    # 3. 標註最高價與最低價
     hi_idx = int(plot_df["high"].idxmax())
     hi_val = float(plot_df["high"].iloc[hi_idx])
     lo_idx = int(plot_df["low"].idxmin())
@@ -246,7 +243,6 @@ def render_chart_png(
         fontweight="bold",
     )
 
-    # 4. 畫出 止盈 / 入場 / 止損 水平虛線與右側價格標籤框
     right_x = n + 1.5
     lines_to_draw: list[tuple[str, float, str, str, str]] = []
     if take_profit:
@@ -292,7 +288,7 @@ def render_chart_png(
 def analyze_chart_with_gemini_vision(
     symbol: str, timeframe: str, df: pd.DataFrame, raw_chart_bytes: bytes
 ) -> dict[str, Any]:
-    """直接讓 Gemini Vision 看 K 線圖，辨識型態並回傳趨勢線座標點"""
+    """直接讓 Gemini Vision 看 K 線圖，積極辨識型態並回傳趨勢線座標點"""
     if not GEMINI_API_KEY:
         raise RuntimeError("請設定 GEMINI_API_KEY 才能使用 AI 看圖盯盤")
 
@@ -303,18 +299,18 @@ def analyze_chart_with_gemini_vision(
     recent_low = float(plot_df["low"].tail(20).min())
     img_b64 = base64.b64encode(raw_chart_bytes).decode("utf-8")
 
-    prompt = f"""你是專業的加密貨幣技術分析師。請直接觀察這張 {symbol} ({timeframe} 週期、共 85 根 K 線，最左為 bar 0、最右最新收盤為 bar 84) 的最新 K 線圖。
+    prompt = f"""你是敏銳的加密貨幣交易員。請觀察這張 {symbol} ({timeframe} 週期、共 85 根 K 線，最左為 bar 0、最右最新收盤為 bar 84) 的 K 線圖。
 目前最新收盤價為 {_fmt_price(last_price)}，近 20 根最高 {_fmt_price(recent_high)}、最低 {_fmt_price(recent_low)}。
-圖上主要波段轉折點參考（bar 編號與價格）：
+圖上主要轉折點參考（bar 編號與價格）：
 {json.dumps(pivots, ensure_ascii=False)}
 
-請檢查圖中「最右側（最新一段走勢）」是否正在形成或剛觸發以下任何清晰型態或結構：
-1. 三角收斂 / 末端緊密壓縮收斂（包含對稱三角、上升/下降三角、旗形收斂，哪怕只有 10-15 根 K 線的小收斂也算）
-2. M 頭 / W 底 / 頭肩頂 / 頭肩底
-3. 關鍵支撐壓力帶量突破，或假跌破 / 假突破獵取 (Liquidity Sweep)
+請積極尋找圖中「最右側（最新一段走勢）」正在醞釀或剛觸發的交易結構，只要看到以下任一情形即可視為有效型態（has_pattern = true，不用等到完全走完）：
+1. 三角收斂 / 末端壓縮 / 旗形 / 楔形（包含近 8-15 根 K 線的短線緊密收斂）
+2. M 頭 / W 底 / 頭肩頂 / 頭肩底（包含剛形成右肩或第二頂底、正在測試頸線的雛形）
+3. 上升或下降通道、箱體震盪邊緣測試、關鍵支撐壓力突破，或長上下影線假跌破/假突破（Pin Bar / Liquidity Sweep）
 
-如果沒有明確型態（只是無序震盪），請將 has_pattern 設為 false。
-如果有明確型態，請給出具體的入場點、止損點、止盈點，並從轉折點（或 bar 84）挑出座標組合成 `trend_lines` 以便在圖上畫出結構線（例如 M 頭就回傳 1 條 4-5 個點的折線 `[[[b1,p1],[b2,p2],[b3,p3],[b4,p4]]]`；三角收斂就回傳 2 條線，分別是上緣與下緣 `[[[b1,h1],[84,h2]], [[b3,l1],[84,l2]]]`）。只回傳純 JSON：
+只有在K線完全沒有方向與結構時才設為 false。
+若有型態，請給出建議入場點、止損點、止盈點（風險報酬比約 1:1.5 到 1:2.5），並挑出 `trend_lines` 座標點畫出結構線（例如 M 頭回傳 1 條折線 `[[[b1,p1],[b2,p2],[b3,p3],[b4,p4]]]`；三角收斂或通道回傳 2 條邊緣線 `[[[b1,h1],[84,h2]], [[b3,l1],[84,l2]]]`）。只回傳純 JSON：
 {{
   "has_pattern": true 或 false,
   "pattern_name": "型態名稱",
@@ -419,7 +415,7 @@ def run(ignore_time_window: bool = False) -> None:
                     send_telegram_photo(marked_chart, msg)
                     print(f"[已推播] {symbol} {tf}: {ai_result.get('pattern_name')}")
                 else:
-                    print(f"[無明確型態] {symbol} {tf} (has_pattern={ai_result.get('has_pattern')}, conf={ai_result.get('confidence')})")
+                    print(f"[未達門檻] {symbol} {tf} -> {ai_result.get('pattern_name')} (has_pattern={ai_result.get('has_pattern')}, conf={ai_result.get('confidence')})")
 
             except Exception as exc:
                 print(f"[錯誤] {symbol} {tf} 處理失敗: {exc}")
