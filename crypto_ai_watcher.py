@@ -206,8 +206,7 @@ def _call_gemini(parts: list[dict[str, Any]]) -> dict[str, Any]:
 
     models_to_try = [
         GEMINI_MODEL,
-        "gemini-2.5-flash",
-        "gemini-2.5-flash-lite",
+        "gemini-3.5-flash-lite",
     ]
     last_exc: Exception | None = None
     for model_name in dict.fromkeys(models_to_try):
