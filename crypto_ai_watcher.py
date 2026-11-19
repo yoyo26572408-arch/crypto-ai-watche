@@ -33,7 +33,7 @@ CANDLE_LIMIT = 200
 MIN_AI_CONFIDENCE = int(os.getenv("MIN_AI_CONFIDENCE", "6"))
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 # ======================================================
@@ -117,18 +117,27 @@ def _extract_chart_pivots(plot_df: pd.DataFrame, window: int = 3) -> list[dict[s
 
 
 def _call_gemini(parts: list[dict[str, Any]]) -> dict[str, Any]:
-    """統一呼叫 Gemini API 並解析 JSON 回傳"""
+    """統一呼叫 Gemini API 並解析 JSON 回傳（支援自動切換備用模型）"""
     if not GEMINI_API_KEY:
         raise RuntimeError("請設定 GEMINI_API_KEY")
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
-    payload = {
-        "contents": [{"parts": parts}],
-        "generationConfig": {"temperature": 0.2, "responseMimeType": "application/json"},
-    }
-    resp = requests.post(url, json=payload, timeout=45)
-    resp.raise_for_status()
-    text = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
-    return json.loads(text)
+
+    models_to_try = [GEMINI_MODEL, "gemini-2.5-flash-lite"]
+    last_exc: Exception | None = None
+    for model_name in dict.fromkeys(models_to_try):
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={GEMINI_API_KEY}"
+        payload = {
+            "contents": [{"parts": parts}],
+            "generationConfig": {"responseMimeType": "application/json"},
+        }
+        resp = requests.post(url, json=payload, timeout=45)
+        if resp.status_code == 404:
+            last_exc = requests.HTTPError(f"404 Not Found for {model_name}", response=resp)
+            continue
+        resp.raise_for_status()
+        text = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
+        return json.loads(text)
+
+    raise last_exc or RuntimeError("Gemini API 呼叫失敗")
 
 
 def render_chart_png(
@@ -393,7 +402,6 @@ def check_telegram_user_query() -> str | None:
             if str(msg.get("chat", {}).get("id", "")) == str(TELEGRAM_CHAT_ID) and msg.get("text"):
                 user_msg = msg["text"].strip()
 
-        # 標記這批訊息已讀，避免下次重複回覆
         requests.get(url, params={"offset": max_id + 1, "timeout": 1}, timeout=10)
         return user_msg
     except Exception as exc:
@@ -465,7 +473,6 @@ def run(ignore_time_window: bool = False) -> None:
             try:
                 time.sleep(0.4)
                 df = fetch_ohlcv(exchange, symbol, tf, limit=CANDLE_LIMIT, fallback_exchange=fallback_exchange)
-                # 若使用者主動在 Telegram 詢問狀態，強制掃描所有週期以便回報最新情況
                 if not ignore_time_window and not user_query and not is_recently_closed_for_tf(df, tf):
                     continue
 
@@ -474,8 +481,7 @@ def run(ignore_time_window: bool = False) -> None:
 
                 s1 = stage1_detect_pattern_from_chart(symbol, tf, df, raw_chart)
                 if not s1.get("has_pattern"):
-                    msg_line = f"• <b>{short_sym} ({tf})</b>：無明確型態"
-                    status_lines.append(msg_line)
+                    status_lines.append(f"• <b>{short_sym} ({tf})</b>：無明確型態")
                     print(f"[第一關過濾] {symbol} {tf} 無明確型態")
                     continue
 
@@ -521,7 +527,6 @@ def run(ignore_time_window: bool = False) -> None:
                 error_lines.append(err_msg)
                 print(f"[錯誤] {symbol} {tf} 處理失敗: {exc}")
 
-    # 若你在 Telegram 傳訊詢問，或本輪有發生系統錯誤，主動回傳一份體檢總結
     if user_query or error_lines:
         now_tw = datetime.now(tz_tw).strftime("%m-%d %H:%M")
         header = (
