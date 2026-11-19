@@ -1,11 +1,5 @@
 """
-Crypto AI Vision Market Watcher（兩段式 AI + Telegram 互動體檢報告 + 抗限流版）
-流程：
-  1. 檢查 Telegram 是否有你的新提問（例如傳「狀態」「有沒有出錯」），若有則標記本輪結束後回報完整體檢清單
-  2. 從交易所 (BingX 優先 + Gate 備援) 抓取 30m / 1h / 4h / 1d K 線並繪製圖表
-  3. 【AI 第一關】看圖辨識：抓出清晰型態與趨勢折線，過濾純震盪雜訊
-  4. 【AI 第二關】風控評分：評估風險與量價，通過門檻即畫上趨勢線與入場/止損/止盈推播
-  5. 若你有發問或本輪出現系統錯誤，自動回傳各幣種狀態報告到 Telegram
+Crypto AI Vision Market Watcher（兩段式 AI + 抗 503/429 重試 + 冷卻防重複 + 正確收盤時間版）
 """
 
 import argparse
@@ -15,6 +9,7 @@ import json
 import os
 import time
 from datetime import datetime, timezone, timedelta
+from pathlib import Path
 from typing import Any
 
 import ccxt
@@ -31,12 +26,45 @@ SYMBOLS = os.getenv("SYMBOLS", "BTC/USDT:USDT,ETH/USDT:USDT,SOL/USDT:USDT,SUI/US
 TIMEFRAMES = os.getenv("TIMEFRAMES", "30m,1h,4h,1d").split(",")
 CANDLE_LIMIT = 200
 MIN_AI_CONFIDENCE = int(os.getenv("MIN_AI_CONFIDENCE", "6"))
+HISTORY_FILE = Path("sent_history.json")
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 # ======================================================
+
+TF_MINUTES_MAP = {"15m": 15, "30m": 30, "1h": 60, "4h": 240, "1d": 1440}
+COOLDOWN_HOURS_MAP = {"15m": 2, "30m": 3, "1h": 6, "4h": 16, "1d": 48}
+
+
+def load_history() -> dict[str, Any]:
+    if HISTORY_FILE.exists():
+        try:
+            return json.loads(HISTORY_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+    return {}
+
+
+def save_history(history: dict[str, Any]) -> None:
+    HISTORY_FILE.write_text(json.dumps(history, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def is_in_cooldown(history: dict[str, Any], symbol: str, tf: str, bias: str, entry: float) -> bool:
+    """檢查同一幣種與週期是否在冷卻期內（避免連續兩次跳出一模一樣的型態）"""
+    key = f"{symbol}|{tf}"
+    rec = history.get(key)
+    if not rec:
+        return False
+    elapsed_hours = (time.time() - float(rec.get("ts", 0))) / 3600
+    cooldown_h = COOLDOWN_HOURS_MAP.get(tf, 3)
+    if elapsed_hours >= cooldown_h:
+        return False
+    same_bias = rec.get("bias") == bias
+    last_entry = float(rec.get("entry", 0))
+    similar_price = last_entry > 0 and abs(entry - last_entry) / last_entry <= 0.015
+    return same_bias and similar_price
 
 
 def fetch_ohlcv(
@@ -93,7 +121,6 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _fmt_price(val: float) -> str:
-    """依幣種價位自動決定小數位數"""
     if val >= 1000:
         return f"{val:,.1f}"
     if val >= 10:
@@ -104,7 +131,6 @@ def _fmt_price(val: float) -> str:
 
 
 def _extract_chart_pivots(plot_df: pd.DataFrame, window: int = 3) -> list[dict[str, Any]]:
-    """擷取最近 85 根 K 線內的轉折高低點索引與價位，供 AI 畫出趨勢折線"""
     pivots: list[dict[str, Any]] = []
     for i in range(window, len(plot_df) - window):
         h_slice = plot_df["high"].iloc[i - window : i + window + 1]
@@ -117,7 +143,7 @@ def _extract_chart_pivots(plot_df: pd.DataFrame, window: int = 3) -> list[dict[s
 
 
 def _call_gemini(parts: list[dict[str, Any]]) -> dict[str, Any]:
-    """統一呼叫 Gemini API 並解析 JSON 回傳（支援自動切換備用模型）"""
+    """呼叫 Gemini API，遇 429/503 自動退避重試，並支援備用模型"""
     if not GEMINI_API_KEY:
         raise RuntimeError("請設定 GEMINI_API_KEY")
 
@@ -129,13 +155,21 @@ def _call_gemini(parts: list[dict[str, Any]]) -> dict[str, Any]:
             "contents": [{"parts": parts}],
             "generationConfig": {"responseMimeType": "application/json"},
         }
-        resp = requests.post(url, json=payload, timeout=45)
-        if resp.status_code == 404:
-            last_exc = requests.HTTPError(f"404 Not Found for {model_name}", response=resp)
-            continue
-        resp.raise_for_status()
-        text = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
-        return json.loads(text)
+        for attempt in range(1, 4):
+            time.sleep(2.0)  # 節流，避免短時間連發觸發 429/503
+            resp = requests.post(url, json=payload, timeout=45)
+            if resp.status_code == 404:
+                last_exc = requests.HTTPError(f"404 Not Found for {model_name}", response=resp)
+                break
+            if resp.status_code in (429, 500, 502, 503, 504):
+                last_exc = requests.HTTPError(f"{resp.status_code} for {model_name}", response=resp)
+                wait_sec = 4 * attempt
+                print(f"[Gemini {resp.status_code}] 等待 {wait_sec}s 後重試 ({attempt}/3)...")
+                time.sleep(wait_sec)
+                continue
+            resp.raise_for_status()
+            text = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
+            return json.loads(text)
 
     raise last_exc or RuntimeError("Gemini API 呼叫失敗")
 
@@ -149,7 +183,7 @@ def render_chart_png(
     take_profit: float | None = None,
     trend_lines: list[list[list[float]]] | None = None,
 ) -> bytes:
-    """繪製仿 BingX / TradingView 風格 K 線圖（含趨勢折線、目標預測箭頭與入場/止損/止盈線）"""
+    """繪製仿 BingX / TradingView 風格 K 線圖"""
     if "ema20" not in df.columns:
         df = add_indicators(df.copy())
 
@@ -351,7 +385,7 @@ def stage1_detect_pattern_from_chart(
 def stage2_score_risk_and_plan(
     symbol: str, timeframe: str, df: pd.DataFrame, raw_chart_bytes: bytes, stage1_result: dict[str, Any]
 ) -> dict[str, Any]:
-    """【AI 第二關】風控評分：評估結構風險、量價配合與風報比，決定是否放行並輸出入場/止損/止盈"""
+    """【AI 第二關】風控評分"""
     recent = df.tail(25)[["dt", "open", "high", "low", "close", "volume", "ema20", "ema50", "rsi", "atr"]].copy()
     recent["dt"] = recent["dt"].dt.strftime("%m-%d %H:%M")
     candles_text = recent.round(4).to_string(index=False)
@@ -384,7 +418,6 @@ def stage2_score_risk_and_plan(
 
 
 def check_telegram_user_query() -> str | None:
-    """檢查你在 Telegram 是否傳了新訊息詢問狀態，並自動標記已讀避免重複回覆"""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return None
     try:
@@ -410,7 +443,6 @@ def check_telegram_user_query() -> str | None:
 
 
 def send_telegram_text(text: str) -> None:
-    """透過 Telegram Bot 發送純文字狀態報告"""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         print("[模擬文字推播]\n" + text)
         return
@@ -424,7 +456,6 @@ def send_telegram_text(text: str) -> None:
 
 
 def send_telegram_photo(image_bytes: bytes, caption: str) -> None:
-    """透過 Telegram Bot 發送 K 線圖與分析說明"""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         print("[模擬推播] 未設定 Telegram Token/Chat ID，訊息內容如下：\n" + caption)
         return
@@ -439,9 +470,8 @@ def send_telegram_photo(image_bytes: bytes, caption: str) -> None:
 
 
 def is_recently_closed_for_tf(df: pd.DataFrame, timeframe: str) -> bool:
-    """配合每 30 分鐘準時觸發，確保各週期只在剛收盤時檢查一次、不重複推播"""
     last_open_utc = df["dt"].iloc[-1].to_pydatetime()
-    tf_minutes = {"15m": 15, "30m": 30, "1h": 60, "4h": 240, "1d": 1440}.get(timeframe, 30)
+    tf_minutes = TF_MINUTES_MAP.get(timeframe, 30)
     last_close_utc = last_open_utc + timedelta(minutes=tf_minutes)
     age_minutes = (datetime.now(timezone.utc) - last_close_utc).total_seconds() / 60
     return age_minutes <= 35
@@ -452,6 +482,7 @@ def run(ignore_time_window: bool = False) -> None:
     if user_query:
         print(f"[收到 Telegram 提問] {user_query}")
 
+    history = load_history()
     exchange_cls = getattr(ccxt, EXCHANGE_ID)
     exchange = exchange_cls({"enableRateLimit": True})
     fallback_cls = getattr(ccxt, FALLBACK_EXCHANGE_ID, None)
@@ -491,11 +522,19 @@ def run(ignore_time_window: bool = False) -> None:
 
                 if risk_score >= MIN_AI_CONFIDENCE:
                     last_price = float(df["close"].iloc[-1])
-                    candle_tw = df["dt"].iloc[-1].astimezone(tz_tw).strftime("%Y-%m-%d %H:%M")
+                    tf_mins = TF_MINUTES_MAP.get(tf, 30)
+                    close_dt_tw = (df["dt"].iloc[-1] + timedelta(minutes=tf_mins)).astimezone(tz_tw)
+                    candle_tw = close_dt_tw.strftime("%Y-%m-%d %H:%M")
 
                     entry_p = float(s2.get("entry") or last_price)
                     sl_p = float(s2.get("stop_loss") or last_price * 0.98)
                     tp_p = float(s2.get("take_profit") or last_price * 1.04)
+
+                    if not user_query and is_in_cooldown(history, symbol, tf, str(s1.get("bias")), entry_p):
+                        status_lines.append(f"• <b>{short_sym} ({tf})</b>：⏳ 同結構冷卻中（不重複發圖）")
+                        print(f"[冷卻略過] {symbol} {tf} 與上次通知相同，略過重複發圖")
+                        continue
+
                     risk = abs(entry_p - sl_p)
                     rr = abs(tp_p - entry_p) / risk if risk > 0 else 0
 
@@ -508,11 +547,18 @@ def run(ignore_time_window: bool = False) -> None:
                         f"🔔 <b>AI 盯盤警報｜{symbol} ({tf})</b>\n"
                         f"• <b>型態結構</b>：{s1.get('pattern_name')}（{s1.get('bias')}）\n"
                         f"• <b>風險評分</b>：{risk_score}/10（{s2.get('risk_level')}）\n"
-                        f"• <b>現價</b>：{_fmt_price(last_price)}（{candle_tw} UTC+8）\n"
+                        f"• <b>現價</b>：{_fmt_price(last_price)}（收盤 {candle_tw} UTC+8）\n"
                         f"• <b>參考規劃</b>：入場 <code>{_fmt_price(entry_p)}</code> ｜ 止損 <code>{_fmt_price(sl_p)}</code> ｜ 止盈 <code>{_fmt_price(tp_p)}</code>（R:R ≈ 1:{rr:.1f}）\n"
                         f"• <b>AI 分析</b>：{s2.get('summary')}"
                     )
                     send_telegram_photo(marked_chart, msg)
+                    history[f"{symbol}|{tf}"] = {
+                        "pattern": s1.get("pattern_name"),
+                        "bias": s1.get("bias"),
+                        "entry": entry_p,
+                        "ts": time.time(),
+                    }
+                    save_history(history)
                     status_lines.append(f"• <b>{short_sym} ({tf})</b>：✅ 已發圖（{s1.get('pattern_name')}，{risk_score}/10）")
                     print(f"[第二關通過已推播] {symbol} {tf}: 評分 {risk_score}/10")
                 else:
