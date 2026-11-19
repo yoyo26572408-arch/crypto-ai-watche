@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 import ccxt
+import matplotlib.pyplot as plt
 import mplfinance as mpf
 import numpy as np
 import pandas as pd
@@ -54,8 +55,10 @@ def save_history(history: dict[str, Any]) -> None:
     HISTORY_FILE.write_text(json.dumps(history, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def is_in_cooldown_precheck(history: dict[str, Any], symbol: str, tf: str, current_price: float | None = None) -> tuple[bool, str]:
-    """在呼叫 AI 之前先檢查冷卻狀態，冷卻中直接跳過，省下大量等待時間"""
+def is_in_cooldown_precheck(
+    history: dict[str, Any], symbol: str, tf: str, current_price: float | None = None
+) -> tuple[bool, str]:
+    """在呼叫 AI 之前先檢查冷卻狀態，若價格偏離上次進場點 > 2% 則提早解除冷卻"""
     key = f"{symbol}|{tf}"
     rec = history.get(key)
     if not isinstance(rec, dict):
@@ -70,17 +73,53 @@ def is_in_cooldown_precheck(history: dict[str, Any], symbol: str, tf: str, curre
     return True, str(rec.get("pattern") or "已推播結構")
 
 
-def _suggest_leverage(entry: float, stop_loss: float) -> tuple[int, float, float]:
-    """依止損距離計算建議槓桿倍率（控制打損約虧保證金 15%，限制在 2x ~ 20x 之間）"""
-    if entry <= 0:
-        return 5, 0.0, 0.0
+def _validate_trade_plan(bias: str, entry: float, stop_loss: float, take_profit: float) -> tuple[bool, str]:
+    """嚴格校驗 AI 給出的多空點位邏輯與止損距離"""
+    if entry <= 0 or stop_loss <= 0 or take_profit <= 0:
+        return False, "點位數值異常 (<= 0)"
+
     sl_pct = abs(entry - stop_loss) / entry
     if sl_pct <= 0.001:
-        sl_pct = 0.01
+        return False, f"止損距離過窄 ({sl_pct * 100:.3f}%)"
+
+    if "偏多" in bias:
+        if not (stop_loss < entry < take_profit):
+            return False, f"偏多點位邏輯錯誤 (SL={stop_loss}, Entry={entry}, TP={take_profit})"
+    elif "偏空" in bias:
+        if not (take_profit < entry < stop_loss):
+            return False, f"偏空點位邏輯錯誤 (TP={take_profit}, Entry={entry}, SL={stop_loss})"
+    else:
+        # 待突破確認：至少確保 SL 與 TP 位於 Entry 兩側
+        if (entry - stop_loss) * (take_profit - entry) <= 0:
+            return False, "SL 與 TP 位於 Entry 同側"
+
+    return True, ""
+
+
+def _suggest_leverage(entry: float, stop_loss: float) -> tuple[int, float, float]:
+    """依止損距離計算建議槓桿倍率（控制打損約虧保證金 15%，限制在 2x ~ 20x 之間）"""
+    sl_pct = abs(entry - stop_loss) / entry
     raw_lev = int(MAX_MARGIN_LOSS_PCT / sl_pct)
     lev = max(2, min(20, raw_lev))
     est_margin_loss_pct = sl_pct * lev * 100
     return lev, sl_pct * 100, est_margin_loss_pct
+
+
+def fetch_ticker_price(
+    exchange: ccxt.Exchange, symbol: str, fallback_exchange: ccxt.Exchange | None = None
+) -> float | None:
+    """輕量取得最新成交價，供冷卻期波動檢查使用"""
+    for ex in (exchange, fallback_exchange):
+        if ex is None:
+            continue
+        try:
+            ticker = ex.fetch_ticker(symbol)
+            price = ticker.get("last") or ticker.get("close")
+            if price:
+                return float(price)
+        except Exception:
+            continue
+    return None
 
 
 def fetch_ohlcv(
@@ -118,20 +157,22 @@ def fetch_ohlcv(
 
 
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    """計算 EMA20、EMA50、RSI(14)、ATR(14) 與 20 週期均量"""
+    """計算 EMA20、EMA50、RSI(14)、ATR(14)（採 Wilder's Smoothing 對齊 TradingView）與 20 週期均量"""
     df["ema20"] = df["close"].ewm(span=20, adjust=False).mean()
     df["ema50"] = df["close"].ewm(span=50, adjust=False).mean()
+
     delta = df["close"].diff()
-    gain = delta.clip(lower=0).rolling(14).mean()
-    loss = (-delta.clip(upper=0)).rolling(14).mean()
+    gain = delta.clip(lower=0).ewm(alpha=1 / 14, adjust=False).mean()
+    loss = (-delta.clip(upper=0)).ewm(alpha=1 / 14, adjust=False).mean()
     rs = gain / loss.replace(0, np.nan)
     df["rsi"] = 100 - (100 / (1 + rs))
+
     tr = pd.concat([
         df["high"] - df["low"],
         (df["high"] - df["close"].shift()).abs(),
         (df["low"] - df["close"].shift()).abs(),
     ], axis=1).max(axis=1)
-    df["atr"] = tr.rolling(14).mean()
+    df["atr"] = tr.ewm(alpha=1 / 14, adjust=False).mean()
     df["vol_ma20"] = df["volume"].rolling(20).mean()
     return df
 
@@ -295,126 +336,130 @@ def render_chart_png(
         tight_layout=True,
     )
 
-    ax_main = axes[0]
-    n = len(ohlcv_df)
+    try:
+        ax_main = axes[0]
+        n = len(ohlcv_df)
 
-    if is_high_prob:
+        if is_high_prob:
+            ax_main.text(
+                0.015,
+                0.96,
+                f" ★ HIGH WIN-RATE {high_prob_score}0%+ ({high_prob_score}/10) ★ ",
+                transform=ax_main.transAxes,
+                color="#0b0e11",
+                fontsize=10.5,
+                fontweight="bold",
+                va="top",
+                ha="left",
+                bbox=dict(boxstyle="round,pad=0.35", facecolor="#f0b90b", edgecolor="#fff3cd", linewidth=1.5),
+                zorder=10,
+            )
+
+        if isinstance(trend_lines, list):
+            for line in trend_lines:
+                if not isinstance(line, list) or len(line) < 2:
+                    continue
+                xs, ys = [], []
+                for pt in line:
+                    if isinstance(pt, (list, tuple)) and len(pt) == 2:
+                        bx = max(0.0, min(float(n - 1), float(pt[0])))
+                        py = float(pt[1])
+                        if chart_min * 0.85 <= py <= chart_max * 1.15:
+                            xs.append(bx)
+                            ys.append(py)
+                if len(xs) >= 2:
+                    ax_main.plot(xs, ys, color="#b2b5be", linewidth=2.0, alpha=0.9, zorder=5)
+
+        if tp_v is not None:
+            start_y = entry_v if entry_v is not None else last_price
+            arrow_color = "#0ecb81" if tp_v >= start_y else "#f6465d"
+            ax_main.annotate(
+                "",
+                xy=(n + 7, tp_v),
+                xytext=(n - 1, start_y),
+                arrowprops=dict(arrowstyle="->,head_width=0.45,head_length=0.6", color=arrow_color, lw=2.0, alpha=0.95),
+                zorder=6,
+            )
+
+        hi_idx = int(plot_df["high"].idxmax())
+        hi_val = float(plot_df["high"].iloc[hi_idx])
+        lo_idx = int(plot_df["low"].idxmin())
+        lo_val = float(plot_df["low"].iloc[lo_idx])
+
+        hi_offset = 6 if hi_idx < n - 12 else -14
+        ax_main.plot([hi_idx, hi_idx + hi_offset], [hi_val, hi_val], color="#eaecef", linewidth=0.9)
         ax_main.text(
-            0.015,
-            0.96,
-            f" ★ HIGH WIN-RATE {high_prob_score}0%+ ({high_prob_score}/10) ★ ",
-            transform=ax_main.transAxes,
-            color="#0b0e11",
-            fontsize=10.5,
+            hi_idx + hi_offset + (0.6 if hi_offset > 0 else -0.6),
+            hi_val,
+            _fmt_price(hi_val),
+            color="#eaecef",
+            fontsize=9,
+            va="center",
+            ha="left" if hi_offset > 0 else "right",
             fontweight="bold",
-            va="top",
-            ha="left",
-            bbox=dict(boxstyle="round,pad=0.35", facecolor="#f0b90b", edgecolor="#fff3cd", linewidth=1.5),
-            zorder=10,
         )
 
-    if isinstance(trend_lines, list):
-        for line in trend_lines:
-            if not isinstance(line, list) or len(line) < 2:
-                continue
-            xs, ys = [], []
-            for pt in line:
-                if isinstance(pt, (list, tuple)) and len(pt) == 2:
-                    bx = max(0.0, min(float(n - 1), float(pt[0])))
-                    py = float(pt[1])
-                    if chart_min * 0.85 <= py <= chart_max * 1.15:
-                        xs.append(bx)
-                        ys.append(py)
-            if len(xs) >= 2:
-                ax_main.plot(xs, ys, color="#b2b5be", linewidth=2.0, alpha=0.9, zorder=5)
-
-    if tp_v is not None:
-        start_y = entry_v if entry_v is not None else last_price
-        arrow_color = "#0ecb81" if tp_v >= start_y else "#f6465d"
-        ax_main.annotate(
-            "",
-            xy=(n + 7, tp_v),
-            xytext=(n - 1, start_y),
-            arrowprops=dict(arrowstyle="->,head_width=0.45,head_length=0.6", color=arrow_color, lw=2.0, alpha=0.95),
-            zorder=6,
+        lo_offset = 6 if lo_idx < n - 12 else -14
+        ax_main.plot([lo_idx, lo_idx + lo_offset], [lo_val, lo_val], color="#eaecef", linewidth=0.9)
+        ax_main.text(
+            lo_idx + lo_offset + (0.6 if lo_offset > 0 else -0.6),
+            lo_val,
+            _fmt_price(lo_val),
+            color="#eaecef",
+            fontsize=9,
+            va="center",
+            ha="left" if lo_offset > 0 else "right",
+            fontweight="bold",
         )
 
-    hi_idx = int(plot_df["high"].idxmax())
-    hi_val = float(plot_df["high"].iloc[hi_idx])
-    lo_idx = int(plot_df["low"].idxmin())
-    lo_val = float(plot_df["low"].iloc[lo_idx])
+        right_x = n + 1.5
+        lines_to_draw: list[tuple[str, float, str, str, str]] = []
+        if tp_v is not None:
+            lines_to_draw.append(("TP", tp_v, "#0ecb81", "#0c261d", "--"))
+        if entry_v is not None:
+            lines_to_draw.append(("Entry", entry_v, "#eaecef", "#1e2329", "-."))
+        if sl_v is not None:
+            lines_to_draw.append(("SL", sl_v, "#f6465d", "#2c1117", "--"))
 
-    hi_offset = 6 if hi_idx < n - 12 else -14
-    ax_main.plot([hi_idx, hi_idx + hi_offset], [hi_val, hi_val], color="#eaecef", linewidth=0.9)
-    ax_main.text(
-        hi_idx + hi_offset + (0.6 if hi_offset > 0 else -0.6),
-        hi_val,
-        _fmt_price(hi_val),
-        color="#eaecef",
-        fontsize=9,
-        va="center",
-        ha="left" if hi_offset > 0 else "right",
-        fontweight="bold",
-    )
-
-    lo_offset = 6 if lo_idx < n - 12 else -14
-    ax_main.plot([lo_idx, lo_idx + lo_offset], [lo_val, lo_val], color="#eaecef", linewidth=0.9)
-    ax_main.text(
-        lo_idx + lo_offset + (0.6 if lo_offset > 0 else -0.6),
-        lo_val,
-        _fmt_price(lo_val),
-        color="#eaecef",
-        fontsize=9,
-        va="center",
-        ha="left" if lo_offset > 0 else "right",
-        fontweight="bold",
-    )
-
-    right_x = n + 1.5
-    lines_to_draw: list[tuple[str, float, str, str, str]] = []
-    if tp_v is not None:
-        lines_to_draw.append(("TP", tp_v, "#0ecb81", "#0c261d", "--"))
-    if entry_v is not None:
-        lines_to_draw.append(("Entry", entry_v, "#eaecef", "#1e2329", "-."))
-    if sl_v is not None:
-        lines_to_draw.append(("SL", sl_v, "#f6465d", "#2c1117", "--"))
-
-    if lines_to_draw:
-        lines_to_draw.sort(key=lambda item: item[1])
-        min_gap = (y_hi - y_lo) * 0.06
-        placed_ys: list[float] = []
-        for label, price_val, edge_col, bg_col, ls in lines_to_draw:
-            ax_main.axhline(price_val, color=edge_col, linestyle=ls, linewidth=1.2, alpha=0.95)
-            label_y = price_val
-            if placed_ys and (label_y - placed_ys[-1]) < min_gap:
-                label_y = placed_ys[-1] + min_gap
-            placed_ys.append(label_y)
+        if lines_to_draw:
+            lines_to_draw.sort(key=lambda item: item[1])
+            min_gap = (y_hi - y_lo) * 0.06
+            placed_ys: list[float] = []
+            for label, price_val, edge_col, bg_col, ls in lines_to_draw:
+                ax_main.axhline(price_val, color=edge_col, linestyle=ls, linewidth=1.2, alpha=0.95)
+                label_y = price_val
+                if placed_ys and (label_y - placed_ys[-1]) < min_gap:
+                    label_y = placed_ys[-1] + min_gap
+                placed_ys.append(label_y)
+                ax_main.text(
+                    right_x,
+                    label_y,
+                    f" {label} {_fmt_price(price_val)} ",
+                    color=edge_col,
+                    fontsize=9,
+                    va="center",
+                    ha="left",
+                    fontweight="bold",
+                    bbox=dict(boxstyle="round,pad=0.22", facecolor=bg_col, edgecolor=edge_col, linewidth=1),
+                )
+        else:
+            ax_main.plot([n - 1, n + 1.2], [last_price, last_price], color="#eaecef", linestyle=":", linewidth=1.0)
             ax_main.text(
                 right_x,
-                label_y,
-                f" {label} {_fmt_price(price_val)} ",
-                color=edge_col,
+                last_price,
+                f" {_fmt_price(last_price)} ",
+                color="#eaecef",
                 fontsize=9,
                 va="center",
                 ha="left",
                 fontweight="bold",
-                bbox=dict(boxstyle="round,pad=0.22", facecolor=bg_col, edgecolor=edge_col, linewidth=1),
+                bbox=dict(boxstyle="round,pad=0.22", facecolor="#1e2329", edgecolor="#eaecef", linewidth=1),
             )
-    else:
-        ax_main.plot([n - 1, n + 1.2], [last_price, last_price], color="#eaecef", linestyle=":", linewidth=1.0)
-        ax_main.text(
-            right_x,
-            last_price,
-            f" {_fmt_price(last_price)} ",
-            color="#eaecef",
-            fontsize=9,
-            va="center",
-            ha="left",
-            fontweight="bold",
-            bbox=dict(boxstyle="round,pad=0.22", facecolor="#1e2329", edgecolor="#eaecef", linewidth=1),
-        )
 
-    fig.savefig(buf, dpi=220, bbox_inches="tight", facecolor="#0b0e11")
+        fig.savefig(buf, dpi=220, bbox_inches="tight", facecolor="#0b0e11")
+    finally:
+        plt.close(fig)
+
     buf.seek(0)
     return buf.read()
 
@@ -496,7 +541,8 @@ def stage2_score_risk_and_plan(
     ])
 
 
-def check_telegram_user_query() -> str | None:
+def check_telegram_check_command() -> str | None:
+    """僅在收到 /check 指令時才觸發全盤體檢，避免一般訊息誤觸發"""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return None
     try:
@@ -508,17 +554,30 @@ def check_telegram_user_query() -> str | None:
             return None
 
         max_id = max(u["update_id"] for u in updates)
-        user_msg = None
+        trigger_msg = None
         for u in updates:
             msg = u.get("message") or {}
-            if str(msg.get("chat", {}).get("id", "")) == str(TELEGRAM_CHAT_ID) and msg.get("text"):
-                user_msg = msg["text"].strip()
+            if str(msg.get("chat", {}).get("id", "")) == str(TELEGRAM_CHAT_ID):
+                text = (msg.get("text") or "").strip()
+                if text.lower().startswith("/check"):
+                    trigger_msg = text
 
         requests.get(url, params={"offset": max_id + 1, "timeout": 1}, timeout=10)
-        return user_msg
+        return trigger_msg
     except Exception as exc:
         print(f"[Telegram 收訊檢查失敗] {exc}")
         return None
+
+
+def _safe_join_lines(header: str, lines: list[str], max_len: int = 3900) -> str:
+    """按行安全組合訊息，避免切破 HTML 標籤"""
+    out = header
+    for line in lines:
+        if len(out) + len(line) + 1 > max_len:
+            out += "\n...(訊息過長，其餘省略)"
+            break
+        out += line + "\n"
+    return out.rstrip()
 
 
 def send_telegram_text(text: str) -> None:
@@ -528,7 +587,7 @@ def send_telegram_text(text: str) -> None:
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     resp = requests.post(
         url,
-        json={"chat_id": TELEGRAM_CHAT_ID, "text": text[:4000], "parse_mode": "HTML", "disable_web_page_preview": True},
+        json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True},
         timeout=15,
     )
     resp.raise_for_status()
@@ -541,7 +600,7 @@ def send_telegram_photo(image_bytes: bytes, caption: str) -> None:
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
     resp = requests.post(
         url,
-        data={"chat_id": TELEGRAM_CHAT_ID, "caption": caption[:1024], "parse_mode": "HTML"},
+        data={"chat_id": TELEGRAM_CHAT_ID, "caption": caption, "parse_mode": "HTML"},
         files={"photo": ("chart.png", image_bytes, "image/png")},
         timeout=20,
     )
@@ -549,17 +608,18 @@ def send_telegram_photo(image_bytes: bytes, caption: str) -> None:
 
 
 def is_recently_closed_for_tf(df: pd.DataFrame, timeframe: str) -> bool:
+    """收盤後 28 分鐘內才掃描，避免每 30 分鐘排程重複掃描同一根 K 線"""
     last_open_utc = df["dt"].iloc[-1].to_pydatetime()
     tf_minutes = TF_MINUTES_MAP.get(timeframe, 30)
     last_close_utc = last_open_utc + timedelta(minutes=tf_minutes)
     age_minutes = (datetime.now(timezone.utc) - last_close_utc).total_seconds() / 60
-    return -2 <= age_minutes <= 35
+    return -2 <= age_minutes <= 28
 
 
 def run(ignore_time_window: bool = False) -> None:
-    user_query = check_telegram_user_query()
+    user_query = check_telegram_check_command()
     if user_query:
-        print(f"[收到 Telegram 提問] {user_query}")
+        print(f"[收到 Telegram 指令] {user_query}")
 
     history = load_history()
     exchange_cls = getattr(ccxt, EXCHANGE_ID)
@@ -576,12 +636,14 @@ def run(ignore_time_window: bool = False) -> None:
         if not symbol:
             continue
         short_sym = symbol.split("/")[0]
+        current_price = fetch_ticker_price(exchange, symbol, fallback_exchange)
+
         for raw_tf in TIMEFRAMES:
             tf = raw_tf.strip()
             if not tf:
                 continue
             try:
-                in_cd_pre, prev_pat = is_in_cooldown_precheck(history, symbol, tf)
+                in_cd_pre, prev_pat = is_in_cooldown_precheck(history, symbol, tf, current_price)
                 if in_cd_pre:
                     status_lines.append(f"• <b>{short_sym} ({tf})</b>：⏳ 冷卻中（{html.escape(prev_pat)}，略過掃描）")
                     print(f"[冷卻跳過] {symbol} {tf} 直接跳過 AI 掃描")
@@ -601,7 +663,8 @@ def run(ignore_time_window: bool = False) -> None:
                     continue
 
                 pat_name = html.escape(str(s1.get("pattern_name") or "未命名型態"))
-                bias_str = html.escape(str(s1.get("bias") or "待確認"))
+                bias_raw = str(s1.get("bias") or "待確認")
+                bias_str = html.escape(bias_raw)
                 print(f"[第一關命中] {symbol} {tf}: {pat_name} ({bias_str})")
 
                 s2 = stage2_score_risk_and_plan(symbol, tf, df, raw_chart, s1)
@@ -614,14 +677,21 @@ def run(ignore_time_window: bool = False) -> None:
                     candle_tw = close_dt_tw.strftime("%Y-%m-%d %H:%M")
 
                     entry_p = float(s2.get("entry") or last_price)
-                    sl_p = float(s2.get("stop_loss") or last_price * 0.98)
-                    tp_p = float(s2.get("take_profit") or last_price * 1.04)
+                    is_short = "偏空" in bias_raw
+                    sl_p = float(s2.get("stop_loss") or (last_price * 1.02 if is_short else last_price * 0.98))
+                    tp_p = float(s2.get("take_profit") or (last_price * 0.96 if is_short else last_price * 1.04))
+
+                    is_valid, invalid_reason = _validate_trade_plan(bias_raw, entry_p, sl_p, tp_p)
+                    if not is_valid:
+                        status_lines.append(f"• <b>{short_sym} ({tf})</b>：⚠️ 點位校驗未通過（{html.escape(invalid_reason)}）")
+                        print(f"[點位校驗過濾] {symbol} {tf}: {invalid_reason}")
+                        continue
 
                     risk = abs(entry_p - sl_p)
-                    rr = abs(tp_p - entry_p) / risk if risk > 0 else 0
+                    rr = abs(tp_p - entry_p) / risk
                     lev, sl_dist_pct, margin_loss_pct = _suggest_leverage(entry_p, sl_p)
                     risk_lvl = html.escape(str(s2.get("risk_level") or ""))
-                    summary_safe = html.escape(str(s2.get("summary") or "")[:300])
+                    summary_safe = html.escape(str(s2.get("summary") or "")[:240])
 
                     marked_chart = render_chart_png(
                         df, symbol, tf,
@@ -650,7 +720,7 @@ def run(ignore_time_window: bool = False) -> None:
                     send_telegram_photo(marked_chart, msg)
                     history[f"{symbol}|{tf}"] = {
                         "pattern": s1.get("pattern_name"),
-                        "bias": s1.get("bias"),
+                        "bias": bias_raw,
                         "entry": entry_p,
                         "ts": time.time(),
                     }
@@ -677,12 +747,12 @@ def run(ignore_time_window: bool = False) -> None:
             f"目前門檻：風險評分 ≥ <b>{MIN_AI_CONFIDENCE}/10</b>\n"
         )
         if user_query:
-            header += f"收到你的訊息：「<i>{html.escape(user_query[:30])}</i>」\n\n"
+            header += f"收到指令：「<i>{html.escape(user_query[:30])}</i>」\n\n"
         else:
             header += "⚠️ <b>偵測到部分項目異常：</b>\n\n"
 
-        body = "\n".join(status_lines) if status_lines else "本輪無剛收盤的週期。"
-        send_telegram_text(header + body)
+        full_text = _safe_join_lines(header, status_lines) if status_lines else header + "本輪無剛收盤的週期。"
+        send_telegram_text(full_text)
 
 
 if __name__ == "__main__":
