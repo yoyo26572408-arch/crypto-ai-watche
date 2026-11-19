@@ -1,4 +1,584 @@
-"""BingX / Binance Gemini 型態觀察器 v2：AI 評分與統計勝率分開。"""
+"""Gemini K-line watcher v2.1. Standalone; local output only, no Telegram connection."""
+from __future__ import annotations
+
+# --- watcher_stats.py ---
+
+import hashlib
+import json
+import math
+import sqlite3
+from pathlib import Path
+
+VERSION = "forward-v2-limit-3-hold-24"
+PATTERNS = {"head_shoulders_top", "head_shoulders_bottom", "double_top", "double_bottom",
+            "triangle", "wedge", "channel", "flag", "breakout", "liquidity_sweep"}
+TERMINAL = {"win", "loss", "timeout", "unfilled", "data_gap"}
+
+
+def validate_plan(plan, min_rr=1.8):
+    if plan.get("confirmed") is not True:
+        raise ValueError("AI 未確認可執行")
+    if plan.get("bias") not in {"偏多", "偏空"}:
+        raise ValueError("多空方向未確認")
+    for name in ("entry", "stop_loss", "take_profit"):
+        value = plan.get(name)
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
+            raise ValueError(f"{name} 必須為有限正數")
+    entry, sl, tp = (plan[k] for k in ("entry", "stop_loss", "take_profit"))
+    if not ((sl < entry < tp) if plan["bias"] == "偏多" else (tp < entry < sl)):
+        raise ValueError("入場／止損／止盈方向不合理")
+    if abs(entry - sl) / entry <= 0.001:
+        raise ValueError("止損距離過窄")
+    rr = abs(tp - entry) / abs(entry - sl)
+    if rr < min_rr:
+        raise ValueError("風報比未達門檻")
+    score = plan.get("risk_score")
+    if isinstance(score, bool) or not isinstance(score, int) or not 1 <= score <= 10:
+        raise ValueError("AI 評分應為 1–10 整數")
+    return rr
+
+
+def wilson_lower(wins, total, z=1.959963984540054):
+    """Lower endpoint of a two-sided 95% Wilson interval; not a guarantee."""
+    if total == 0:
+        return 0.0
+    p = wins / total
+    return (p + z*z/(2*total) - z*math.sqrt(p*(1-p)/total + z*z/(4*total*total))) / (1 + z*z/total)
+
+
+def cohort_key(exchange, symbol, tf, pattern, plan, model, policy):
+    rr = validate_plan(plan, policy["min_rr"])
+    # Keep instrument, exchange, timeframe, model and rules separate. Avoid mixing easy TP
+    # with difficult TP: use narrow score, R:R and percentage-stop buckets.
+    stop_pct = abs(plan["entry"] - plan["stop_loss"]) / plan["entry"] * 100
+    values = [VERSION, exchange, symbol, tf, pattern, plan["bias"], plan["risk_score"],
+              math.floor(rr * 2), math.floor(stop_pct * 2), model, policy]
+    return json.dumps(values, ensure_ascii=False, sort_keys=True)
+
+
+def fingerprint(pattern, bias, anchor_ms):
+    return f"{pattern}|{bias}|{anchor_ms}"
+
+
+def evaluate(signal, candles):
+    """Consume contiguous CLOSED OHLCV bars strictly after signal creation.
+
+    Entry is a limit order: long entry <= signal close, short entry >= signal close.
+    Gap-through fills use the specified limit price (conservative, no improvement).
+    Entry candle SL always loses; TP alone on entry candle only wins if entry was
+    marketable at the OPEN, otherwise ordering is unknown and TP is ignored.
+    """
+    s = dict(signal)
+    for bar in candles:
+        ts = int(bar[0])
+        if s["status"] in TERMINAL:
+            break
+        if ts < s["next_ms"]:
+            continue
+        if ts != s["next_ms"]:
+            s.update(status="data_gap", resolved_ms=ts + s["tf_ms"])
+            break
+        op, hi, lo = map(float, bar[1:4])
+        long = s["bias"] == "偏多"
+        s["next_ms"] = ts + s["tf_ms"]
+        just_entered = False
+        if s["status"] == "pending":
+            s["waited"] += 1
+            filled = lo <= s["entry"] if long else hi >= s["entry"]
+            if not filled:
+                if s["waited"] >= s["entry_bars"]:
+                    s.update(status="unfilled", resolved_ms=ts + s["tf_ms"])
+                continue
+            just_entered = True
+            s.update(status="open", entered_ms=ts)
+        s["held"] += 1
+        sl_hit = lo <= s["stop_loss"] if long else hi >= s["stop_loss"]
+        tp_hit = hi >= s["take_profit"] if long else lo <= s["take_profit"]
+        entry_at_open = op <= s["entry"] if long else op >= s["entry"]
+        if sl_hit:  # SL first, including ambiguous bars containing both.
+            s.update(status="loss", resolved_ms=ts + s["tf_ms"])
+        elif tp_hit and (not just_entered or entry_at_open):
+            s.update(status="win", resolved_ms=ts + s["tf_ms"])
+        elif s["held"] >= s["hold_bars"]:
+            s.update(status="timeout", resolved_ms=ts + s["tf_ms"])
+    return s
+
+
+class Ledger:
+    def __init__(self, path):
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        self.db = sqlite3.connect(path)
+        self.db.row_factory = sqlite3.Row
+        self.db.executescript("""
+            CREATE TABLE IF NOT EXISTS signals (
+                id TEXT PRIMARY KEY, market TEXT NOT NULL, cohort TEXT NOT NULL,
+                created_ms INTEGER NOT NULL, resolved_ms INTEGER,
+                status TEXT NOT NULL, payload TEXT NOT NULL);
+            CREATE INDEX IF NOT EXISTS signals_cohort ON signals(cohort, resolved_ms);
+            CREATE TABLE IF NOT EXISTS state (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        """)
+
+    def close(self):
+        self.db.close()
+
+    def get(self, key, default=None):
+        row = self.db.execute("SELECT value FROM state WHERE key=?", (key,)).fetchone()
+        return json.loads(row[0]) if row else default
+
+    def set(self, key, value):
+        with self.db:
+            self.db.execute("INSERT OR REPLACE INTO state VALUES (?,?)", (key, json.dumps(value)))
+
+    def save(self, signal):
+        with self.db:
+            self.db.execute("INSERT OR REPLACE INTO signals VALUES (?,?,?,?,?,?,?)", (
+                signal["id"], signal["market"], signal["cohort"], signal["created_ms"],
+                signal.get("resolved_ms"), signal["status"], json.dumps(signal, ensure_ascii=False)))
+
+    def active(self, market=None):
+        sql = "SELECT payload FROM signals WHERE status IN ('pending','open')"
+        rows = self.db.execute(sql + (" AND market=?" if market else ""), (market,) if market else ())
+        return [json.loads(r[0]) for r in rows]
+
+    def add(self, market, cohort, signal_ms, tf_ms, plan, policy, metadata=None):
+        # One pending/open signal per exchange+symbol+timeframe; overlapping labels
+        # otherwise exaggerate the effective sample count.
+        if self.active(market):
+            return None
+        sid = hashlib.sha256(f"{market}|{signal_ms}|{cohort}".encode()).hexdigest()[:24]
+        if self.db.execute("SELECT 1 FROM signals WHERE id=?", (sid,)).fetchone():
+            return None
+        signal = dict(plan, id=sid, market=market, cohort=cohort, created_ms=signal_ms,
+                      tf_ms=tf_ms, next_ms=signal_ms, waited=0, held=0, status="pending",
+                      entry_bars=policy["entry_bars"], hold_bars=policy["hold_bars"],
+                      metadata=metadata or {}, exported=False)
+        self.save(signal)
+        return signal
+
+    def update(self, market, candles):
+        for signal in self.active(market):
+            self.save(evaluate(signal, candles))
+
+    def stats(self, cohort, asof_ms, min_samples=100, threshold=0.8):
+        # Only previously resolved outcomes, never current/future labels. Unfilled
+        # orders do not count as trades; expired filled orders count against success.
+        rows = self.db.execute("""SELECT status, COUNT(*) AS n FROM signals
+            WHERE cohort=? AND resolved_ms<=? GROUP BY status""", (cohort, asof_ms))
+        counts = {r["status"]: r["n"] for r in rows}
+        wins = counts.get("win", 0)
+        total = sum(counts.get(k, 0) for k in ("win", "loss", "timeout"))
+        lower = wilson_lower(wins, total)
+        return dict(wins=wins, total=total, rate=wins/total if total else 0,
+                    lower95=lower, unfilled=counts.get("unfilled", 0),
+                    data_gap=counts.get("data_gap", 0),
+                    eligible=total >= min_samples and lower >= threshold and not counts.get("data_gap", 0))
+
+    def summary(self):
+        return {r[0]: r[1] for r in self.db.execute("SELECT status, COUNT(*) FROM signals GROUP BY status")}
+
+
+# --- watcher_runtime.py ---
+
+import contextlib
+import hashlib
+import json
+import math
+import os
+import re
+import time
+from pathlib import Path
+
+import ccxt
+import numpy as np
+import pandas as pd
+import requests
+
+
+ROOT = Path(__file__).resolve().parent
+
+
+def load_env():
+    path = ROOT / ".env"
+    if path.exists():
+        for line in path.read_text(encoding="utf-8-sig").splitlines():
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                key, value = line.split("=", 1)
+                os.environ.setdefault(key.strip(), value.strip().strip("\"'"))
+
+
+def settings():
+    load_env()
+    cfg = dict(exchange=os.getenv("EXCHANGE_ID", "bingx"),
+               fallback=os.getenv("FALLBACK_EXCHANGE_ID", "binanceusdm"),
+               symbols=[s.strip() for s in os.getenv("SYMBOLS", "BTC/USDT:USDT,ETH/USDT:USDT,SOL/USDT:USDT,SUI/USDT:USDT,ZEC/USDT:USDT").split(",") if s.strip()],
+               timeframes=[s.strip() for s in os.getenv("TIMEFRAMES", "30m,1h,4h,1d").split(",") if s.strip()],
+               policy=dict(entry_bars=int(os.getenv("ENTRY_WAIT_BARS", "3")),
+                           hold_bars=int(os.getenv("HOLD_BARS", "24")),
+                           min_rr=float(os.getenv("MIN_RR", "1.8"))),
+               min_score=int(os.getenv("MIN_AI_CONFIDENCE", "8")),
+               min_samples=int(os.getenv("MIN_SAMPLES", "100")),
+               threshold=float(os.getenv("SUCCESS_THRESHOLD", "0.80")),
+               key=os.getenv("GEMINI_API_KEY", ""), model=os.getenv("GEMINI_MODEL", ""),
+               state_dir=ROOT / os.getenv("STATE_DIR", "state"))
+    if cfg["exchange"] not in {"bingx", "binanceusdm"} or cfg["fallback"] not in {"bingx", "binanceusdm"}:
+        raise ValueError("EXCHANGE_ID / FALLBACK_EXCHANGE_ID 只支援 bingx 或 binanceusdm")
+    if not cfg["symbols"] or not cfg["timeframes"] or not set(cfg["timeframes"]) <= {"15m", "30m", "1h", "4h", "1d"}:
+        raise ValueError("幣種或週期設定不正確")
+    if (not 1 <= cfg["min_score"] <= 10 or cfg["min_samples"] < 1 or
+        not 0.8 <= cfg["threshold"] < 1 or not 1 <= cfg["policy"]["entry_bars"] <= 100 or
+        not 1 <= cfg["policy"]["hold_bars"] <= 1000 or
+        not math.isfinite(cfg["policy"]["min_rr"]) or cfg["policy"]["min_rr"] < 1.8):
+        raise ValueError("門檻設定不正確（成功率至少 0.80、R:R 至少 1.8）")
+    return cfg
+
+
+def safe_error(exc, cfg):
+    text = str(exc)
+    for secret in (cfg.get("key"), cfg.get("token")):
+        if secret:
+            text = text.replace(secret, "[REDACTED]")
+    return text[:300]
+
+
+@contextlib.contextmanager
+def single_instance(folder):
+    folder.mkdir(parents=True, exist_ok=True)
+    handle = (folder / "watcher.lock").open("a+b")
+    handle.seek(0)
+    if not handle.read(1):
+        handle.write(b"0")
+        handle.flush()
+    handle.seek(0)
+    try:
+        if os.name == "nt":
+            import msvcrt
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        handle.close()
+        raise RuntimeError("已有另一個盯盤程序在使用此資料庫") from None
+    try:
+        yield
+    finally:
+        handle.close()
+
+
+def list_models(cfg):
+    if not cfg["key"]:
+        raise ValueError("請先在 .env 設定 GEMINI_API_KEY")
+    models, page = [], None
+    while True:
+        response = requests.get("https://generativelanguage.googleapis.com/v1beta/models",
+                                headers={"x-goog-api-key": cfg["key"]},
+                                params={"pageSize": 1000, **({"pageToken": page} if page else {})}, timeout=30)
+        if response.status_code != 200:
+            raise RuntimeError(f"Gemini 模型清單 HTTP {response.status_code}，請檢查 API Key／權限")
+        body = response.json()
+        models += [m["name"].removeprefix("models/") for m in body.get("models", [])
+                   if "generateContent" in m.get("supportedGenerationMethods", [])]
+        page = body.get("nextPageToken")
+        if not page:
+            return sorted(models)
+
+
+def verify_model(cfg):
+    if not cfg["model"]:
+        raise ValueError("請先執行 --list-models，並將可用的看圖模型填入 .env 的 GEMINI_MODEL")
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", cfg["model"]):
+        raise ValueError("GEMINI_MODEL 格式不正確")
+    if cfg["model"] not in list_models(cfg):
+        raise ValueError("此 GEMINI_MODEL 不在你的可用 generateContent 模型清單中")
+
+
+def call_gemini(cfg, parts):
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{cfg['model']}:generateContent"
+    for attempt in range(3):
+        try:
+            response = requests.post(url, headers={"x-goog-api-key": cfg["key"]},
+                                     json={"contents": [{"parts": parts}],
+                                           "generationConfig": {"responseMimeType": "application/json"}}, timeout=(10, 90))
+        except requests.RequestException:
+            if attempt == 2:
+                raise RuntimeError("Gemini 連線逾時／失敗") from None
+            time.sleep(2 ** (attempt + 1))
+            continue
+        if response.status_code in {429, 500, 502, 503, 504}:
+            time.sleep(min(30, 5 * (attempt + 1)))
+            continue
+        if response.status_code != 200:
+            raise RuntimeError(f"Gemini HTTP {response.status_code}（未自動切換模型，以保持統計一致）")
+        try:
+            candidate = response.json()["candidates"][0]
+            if candidate.get("finishReason") != "STOP":
+                raise ValueError("回應未完整結束")
+            text = "".join(p.get("text", "") for p in candidate["content"]["parts"] if not p.get("thought"))
+            result = json.loads(text)
+            if not isinstance(result, dict):
+                raise ValueError("不是 JSON 物件")
+            return result
+        except (ValueError, KeyError, IndexError, TypeError):
+            raise ValueError("Gemini 回應不完整或 JSON 格式不正確；略過此次訊號") from None
+    raise RuntimeError("Gemini 忙碌，已停止本次請求")
+
+
+def clean_candles(rows, tf_ms, now_ms):
+    df = pd.DataFrame(rows, columns=["timestamp", "open", "high", "low", "close", "volume"])
+    df = df.drop_duplicates("timestamp").sort_values("timestamp")
+    df = df[df["timestamp"] + tf_ms <= now_ms].reset_index(drop=True)
+    if df.empty:
+        raise ValueError("沒有已收盤 K 線")
+    numeric = df.to_numpy(dtype=float)
+    if (not np.isfinite(numeric).all() or (df[["open", "high", "low", "close"]] <= 0).any().any()
+        or (df["volume"] < 0).any() or (df["timestamp"] % tf_ms != 0).any()
+        or (df["high"] < df[["open", "close", "low"]].max(axis=1)).any()
+        or (df["low"] > df[["open", "close", "high"]].min(axis=1)).any()):
+        raise ValueError("交易所 OHLCV 資料不合理")
+    df["dt"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
+    return df
+
+
+def fetch_frame(exchange, symbol, tf, tf_ms, now_ms, since=None):
+    rows = []
+    cursor = since
+    # Paginate open paper trades after downtime; never fill BingX gaps with Binance.
+    for _ in range(100):
+        time.sleep(0.65)
+        batch = None
+        for attempt in range(3):
+            try:
+                batch = exchange.fetch_ohlcv(symbol, tf, since=cursor, limit=500 if cursor is not None else 201)
+                break
+            except (ccxt.NetworkError, ccxt.ExchangeError):
+                if attempt == 2:
+                    raise
+                time.sleep(2 * (attempt + 1))
+        if not batch:
+            break
+        rows.extend(batch)
+        last = max(int(b[0]) for b in batch)
+        if cursor is None or last + tf_ms >= now_ms or last < cursor:
+            break
+        new_cursor = last + tf_ms
+        if cursor is not None and new_cursor <= cursor:
+            break
+        cursor = new_cursor
+    return clean_candles(rows, tf_ms, now_ms)
+
+
+def validate_shape(shape, df):
+    if shape.get("has_pattern") is not True:
+        if shape.get("has_pattern") is not False:
+            raise ValueError("has_pattern 應為布林值")
+        return None
+    if shape.get("pattern_code") not in PATTERNS or shape.get("bias") not in {"偏多", "偏空"}:
+        raise ValueError("型態尚未確認或型態代碼不合法")
+    anchor = shape.get("pattern_start_bar")
+    if isinstance(anchor, bool) or not isinstance(anchor, int) or not 0 <= anchor < min(85, len(df)) - 3:
+        raise ValueError("型態起點座標不合法")
+    lines = shape.get("trend_lines")
+    if not isinstance(lines, list) or not 1 <= len(lines) <= 3:
+        raise ValueError("缺少型態線")
+    window = df.tail(85).reset_index(drop=True)
+    for line in lines:
+        if not isinstance(line, list) or not 2 <= len(line) <= 12:
+            raise ValueError("型態線座標不正確")
+        prev = -1
+        for point in line:
+            if not isinstance(point, list) or len(point) != 2:
+                raise ValueError("型態點座標不正確")
+            x, y = point
+            if (isinstance(x, bool) or not isinstance(x, int) or not prev < x < len(window)
+                or isinstance(y, bool) or not isinstance(y, (int, float)) or not math.isfinite(y)
+                or not float(window["low"].min()) * 0.85 <= y <= float(window["high"].max()) * 1.15):
+                raise ValueError("型態點超出圖表範圍")
+            prev = x
+    return int(window["timestamp"].iloc[anchor])
+
+
+def make_signal_text(signal, stats):
+    m = signal["metadata"]
+    start = pd.Timestamp(signal["created_ms"], unit="ms", tz="UTC").tz_convert("Asia/Taipei")
+    return (f"型態觀察｜{m['symbol']} {m['timeframe']}｜{m['exchange']}\n"
+            f"{m['pattern']}／{signal['bias']} · AI 評分 {signal['risk_score']}/10\n"
+            f"同條件紙上紀錄：{stats['wins']}/{stats['total']}，成功率 {stats['rate']:.1%}\n"
+            f"95% Wilson 下限 {stats['lower95']:.1%}（歷史統計，非本次保證）\n"
+            f"限價入場 {signal['entry']:g}｜止損 {signal['stop_loss']:g}｜止盈 {signal['take_profit']:g}\n"
+            f"追蹤自 {start:%m/%d %H:%M} UTC+8 起，等待 {signal['entry_bars']} 根；進場後 {signal['hold_bars']} 根內有效\n"
+            f"{str(m.get('summary', ''))[:100]}\n"
+            "同根碰止盈止損算失敗；逾期未止盈算未成功。未扣手續費／滑價／資金費。")
+
+
+def export_signal(cfg, signal, stats):
+    """Write one immutable event per signal ID for a separate notifier to consume.
+
+    This function performs local file operations only. No notification service is
+    called, even if legacy notification credentials exist in the environment.
+    """
+    if stats.get("eligible") is not True:
+        raise ValueError("未達門檻的訊號不能輸出至 outbox")
+    folder = cfg["state_dir"] / "outbox"
+    folder.mkdir(parents=True, exist_ok=True)
+    target = folder / f"{signal['id']}.json"
+    if target.exists():
+        return target
+    event = dict(schema_version=1, event="qualified_pattern", signal_id=signal["id"],
+                 emitted_at_ms=int(time.time()*1000), eligible=True,
+                 chart_file=f"../charts/{signal['id']}.png",
+                 text=make_signal_text(signal, stats), statistics=stats, signal=signal)
+    temp = target.with_suffix(".json.tmp")
+    temp.write_text(json.dumps(event, ensure_ascii=False, indent=2), encoding="utf-8")
+    temp.replace(target)
+    return target
+
+
+def cycle(cfg, ledger, chart_module, exchanges, *, scan=True):
+    failures = 0
+    rules_id = hashlib.sha256(json.dumps([VERSION, cfg["model"], cfg["policy"]], sort_keys=True).encode()).hexdigest()[:16]
+    for symbol in cfg["symbols"]:
+        for tf in cfg["timeframes"]:
+            tf_ms = int(ccxt.Exchange.parse_timeframe(tf) * 1000)
+            frames = {}
+            # Track each actual source separately, including a fallback position left
+            # from an earlier run. Never evaluate a BingX plan using Binance candles.
+            needed = list(exchanges)
+            for eid in needed:
+                market = f"{eid}|{symbol}|{tf}"
+                active = ledger.active(market)
+                if not active and frames:
+                    continue
+                now_ms = int(time.time() * 1000)
+                try:
+                    if active:
+                        earliest = min(s["next_ms"] for s in active)
+                        if earliest < now_ms - tf_ms:
+                            follow = fetch_frame(exchanges[eid], symbol, tf, tf_ms, now_ms, earliest)
+                            ledger.update(market, follow[["timestamp", "open", "high", "low", "close", "volume"]].values.tolist())
+                    if not frames:
+                        df = fetch_frame(exchanges[eid], symbol, tf, tf_ms, int(time.time() * 1000))
+                        frames[eid] = df
+                except Exception as exc:
+                    failures += 1
+                    print(f"[行情失敗] {market}: {safe_error(exc, cfg)}", flush=True)
+            if not frames or not scan:
+                continue
+            eid, df = next(iter(frames.items()))
+            market = f"{eid}|{symbol}|{tf}"
+            candle_close = int(df["timestamp"].iloc[-1]) + tf_ms
+            scan_key = f"scan|{rules_id}|{market}"
+            shape_key = f"shape|{rules_id}|{market}"
+            if ledger.get(scan_key, 0) >= candle_close:
+                continue
+            # Don't produce a current alert from old or discontinuous charts.
+            if (len(df) < 85 or int(time.time()*1000) - candle_close > tf_ms
+                or (df["timestamp"].diff().dropna() != tf_ms).any()):
+                print(f"[略過] {market}: K 線不足／過舊／不連續", flush=True)
+                continue
+            if ledger.active(market):
+                # Keep sampling non-overlapping paper trades; analyze again after it resolves.
+                continue
+            try:
+                chart_module._call_gemini = lambda parts: call_gemini(cfg, parts)
+                df = chart_module.add_indicators(df.copy())
+                image = chart_module.render_chart_png(df, symbol, tf, dpi=110)
+                # One AI analysis attempt per closed candle, including refusals and
+                # malformed results. A loop must not repeatedly bill the same bar.
+                ledger.set(scan_key, candle_close)
+                shape = chart_module.stage1_detect_pattern_from_chart(symbol, tf, df, image)
+                anchor = validate_shape(shape, df)
+                if anchor is None:
+                    ledger.set(shape_key, None)
+                    ledger.set(scan_key, candle_close)
+                    print(f"[無型態] {market}", flush=True)
+                    continue
+                signature = fingerprint(shape["pattern_code"], shape["bias"], anchor)
+                if ledger.get(shape_key) == signature:
+                    ledger.set(scan_key, candle_close)
+                    continue
+                plan = chart_module.stage2_score_risk_and_plan(symbol, tf, df, image, shape)
+                plan["bias"] = shape["bias"]
+                validate_plan(plan, cfg["policy"]["min_rr"])
+                last = float(df["close"].iloc[-1])
+                if (plan["entry"] > last if plan["bias"] == "偏多" else plan["entry"] < last):
+                    raise ValueError("本版只接受回踩限價：偏多入場不高於現價，偏空不低於現價")
+                if abs(plan["entry"] / last - 1) > 0.05:
+                    raise ValueError("入場距現價超過 5%")
+                ledger.set(scan_key, candle_close)
+                ledger.set(shape_key, signature)
+                if plan["risk_score"] < cfg["min_score"]:
+                    print(f"[AI未通過] {market}: {plan['risk_score']}/10", flush=True)
+                    continue
+                cohort = cohort_key(eid, symbol, tf, shape["pattern_code"], plan,
+                                    cfg["model"], cfg["policy"])
+                stats = ledger.stats(cohort, int(time.time()*1000), cfg["min_samples"], cfg["threshold"])
+                # Start at the NEXT completely unseen full candle. Never credit a
+                # touch earlier in the partly formed candle while Gemini was thinking.
+                start_ms = (int(time.time()*1000) // tf_ms + 1) * tf_ms
+                metadata = dict(exchange=eid, symbol=symbol, timeframe=tf, pattern=shape["pattern_code"],
+                                summary=str(plan.get("summary", ""))[:400],
+                                signal_close_ms=candle_close, shape=shape, model=cfg["model"], gate=stats)
+                signal = ledger.add(market, cohort, start_ms, tf_ms, plan, cfg["policy"], metadata)
+                if signal is None:
+                    continue
+                folder = cfg["state_dir"] / "charts"
+                folder.mkdir(parents=True, exist_ok=True)
+                marked = chart_module.render_chart_png(df, symbol, tf, entry=plan["entry"],
+                            stop_loss=plan["stop_loss"], take_profit=plan["take_profit"],
+                            trend_lines=shape["trend_lines"], dpi=110)
+                (folder / f"{signal['id']}.png").write_bytes(marked)
+                print(f"[已記錄] {market} {shape['pattern_code']}: {stats['wins']}/{stats['total']}, "
+                      f"Wilson下限 {stats['lower95']:.1%}, 輸出門檻={stats['eligible']}", flush=True)
+                if stats["eligible"]:
+                    output = export_signal(cfg, signal, stats)
+                    signal["exported"] = True
+                    ledger.save(signal)
+                    print(f"[SIGNAL] {output.resolve()}", flush=True)
+            except Exception as exc:
+                failures += 1
+                print(f"[分析略過] {market}: {safe_error(exc, cfg)}", flush=True)
+    return failures
+
+
+def run_watcher(chart_module, watch=False, interval=60, track_only=False):
+    cfg = settings()
+    if not track_only:
+        verify_model(cfg)
+    if not 15 <= interval <= 3600:
+        raise ValueError("輪詢間隔應為 15–3600 秒")
+    cfg["state_dir"].mkdir(parents=True, exist_ok=True)
+    with single_instance(cfg["state_dir"]):
+        ledger = Ledger(cfg["state_dir"] / "signals.sqlite3")
+        exchanges = {eid: getattr(ccxt, eid)({"enableRateLimit": True, "timeout": 15000})
+                     for eid in dict.fromkeys([cfg["exchange"], cfg["fallback"]])}
+        try:
+            print("模擬追蹤模式：只記錄行情與訊號，不下單。Ctrl+C 停止。", flush=True)
+            while True:
+                failures = cycle(cfg, ledger, chart_module, exchanges, scan=not track_only)
+                print("[紀錄統計] " + json.dumps(ledger.summary(), ensure_ascii=False), flush=True)
+                if not watch:
+                    return 1 if failures else 0
+                time.sleep(interval)
+        finally:
+            ledger.close()
+
+
+def show_status():
+    cfg = settings()
+    print("設定狀態（不顯示金鑰）")
+    for field in ("key", "model"):
+        print(f"{field}: {'已設定' if cfg[field] else '未設定'}")
+    path = cfg["state_dir"] / "signals.sqlite3"
+    if path.exists():
+        ledger = Ledger(path)
+        try:
+            print(json.dumps(ledger.summary(), ensure_ascii=False, indent=2))
+        finally:
+            ledger.close()
+
+
+# --- watcher_chart_source.py ---
 
 import argparse
 import base64
@@ -74,7 +654,6 @@ def _extract_chart_pivots(plot_df: pd.DataFrame, window: int = 3) -> list[dict[s
 
 
 def _call_gemini(parts: list[dict[str, Any]]) -> dict[str, Any]:
-    from watcher_runtime import call_gemini, settings
     return call_gemini(settings(), parts)
 
 
@@ -416,8 +995,10 @@ def download_market_data(output_dir: str) -> None:
         raise SystemExit(1)
 
 
+
+
+# --- watcher_cli_source.py ---
 def main():
-    from watcher_runtime import load_env, settings, list_models, run_watcher, show_status
     load_env()
     # Download mode also respects local .env settings.
     global EXCHANGE_ID, FALLBACK_EXCHANGE_ID, SYMBOLS, TIMEFRAMES
@@ -455,6 +1036,5 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print("已停止；模擬紀錄已保存在本機。")
     except Exception as exc:
-        from watcher_runtime import safe_error
-        print("啟動失敗：" + safe_error(exc, {"key": os.getenv("GEMINI_API_KEY"), "token": os.getenv("TELEGRAM_BOT_TOKEN")}))
+        print("啟動失敗：" + safe_error(exc, {"key": os.getenv("GEMINI_API_KEY")}))
         raise SystemExit(1)
