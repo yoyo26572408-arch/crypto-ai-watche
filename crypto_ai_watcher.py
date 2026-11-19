@@ -1,5 +1,5 @@
 """
-Crypto AI Vision Market Watcher（兩段式 AI + 抗 503/429 重試 + 冷卻防重複 + 正確收盤時間版）
+Crypto AI Vision Market Watcher（兩段式 AI + 抗 503/429/Timeout 重試 + 冷卻防重複 + 正確收盤時間版）
 """
 
 import argparse
@@ -143,7 +143,7 @@ def _extract_chart_pivots(plot_df: pd.DataFrame, window: int = 3) -> list[dict[s
 
 
 def _call_gemini(parts: list[dict[str, Any]]) -> dict[str, Any]:
-    """呼叫 Gemini API，遇 429/503 自動退避重試，並支援備用模型"""
+    """呼叫 Gemini API，遇 429/503 或 ReadTimeout 自動退避重試，並支援備用模型"""
     if not GEMINI_API_KEY:
         raise RuntimeError("請設定 GEMINI_API_KEY")
 
@@ -156,20 +156,26 @@ def _call_gemini(parts: list[dict[str, Any]]) -> dict[str, Any]:
             "generationConfig": {"responseMimeType": "application/json"},
         }
         for attempt in range(1, 4):
-            time.sleep(2.0)  # 節流，避免短時間連發觸發 429/503
-            resp = requests.post(url, json=payload, timeout=45)
-            if resp.status_code == 404:
-                last_exc = requests.HTTPError(f"404 Not Found for {model_name}", response=resp)
-                break
-            if resp.status_code in (429, 500, 502, 503, 504):
-                last_exc = requests.HTTPError(f"{resp.status_code} for {model_name}", response=resp)
+            time.sleep(2.0)
+            try:
+                resp = requests.post(url, json=payload, timeout=60)
+                if resp.status_code == 404:
+                    last_exc = requests.HTTPError(f"404 Not Found for {model_name}", response=resp)
+                    break
+                if resp.status_code in (429, 500, 502, 503, 504):
+                    last_exc = requests.HTTPError(f"{resp.status_code} for {model_name}", response=resp)
+                    wait_sec = 4 * attempt
+                    print(f"[Gemini {resp.status_code}] 等待 {wait_sec}s 後重試 ({attempt}/3)...")
+                    time.sleep(wait_sec)
+                    continue
+                resp.raise_for_status()
+                text = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
+                return json.loads(text)
+            except requests.exceptions.RequestException as exc:
+                last_exc = exc
                 wait_sec = 4 * attempt
-                print(f"[Gemini {resp.status_code}] 等待 {wait_sec}s 後重試 ({attempt}/3)...")
+                print(f"[Gemini 連線逾時/錯誤] {exc}，等待 {wait_sec}s 後重試 ({attempt}/3)...")
                 time.sleep(wait_sec)
-                continue
-            resp.raise_for_status()
-            text = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
-            return json.loads(text)
 
     raise last_exc or RuntimeError("Gemini API 呼叫失敗")
 
