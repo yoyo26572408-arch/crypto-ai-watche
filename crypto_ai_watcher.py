@@ -1,5 +1,5 @@
 """
-Crypto AI Vision Market Watcher（兩段式 AI + 抗 503/429/Timeout 重試 + 冷卻防重複 + 正確收盤時間版）
+Crypto AI Vision Market Watcher（Gemini 3.6 Flash 兩段式 AI + 抗 503/429/Timeout 重試 + 冷卻防重複版）
 """
 
 import argparse
@@ -29,7 +29,7 @@ MIN_AI_CONFIDENCE = int(os.getenv("MIN_AI_CONFIDENCE", "6"))
 HISTORY_FILE = Path("sent_history.json")
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 # ======================================================
@@ -147,7 +147,7 @@ def _call_gemini(parts: list[dict[str, Any]]) -> dict[str, Any]:
     if not GEMINI_API_KEY:
         raise RuntimeError("請設定 GEMINI_API_KEY")
 
-    models_to_try = [GEMINI_MODEL, "gemini-2.5-flash-lite"]
+    models_to_try = [GEMINI_MODEL, "gemini-3.5-flash-lite"]
     last_exc: Exception | None = None
     for model_name in dict.fromkeys(models_to_try):
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={GEMINI_API_KEY}"
@@ -358,22 +358,28 @@ def render_chart_png(
 def stage1_detect_pattern_from_chart(
     symbol: str, timeframe: str, df: pd.DataFrame, raw_chart_bytes: bytes
 ) -> dict[str, Any]:
-    """【AI 第一關】看圖辨識：抓出圖上的清晰型態與趨勢折線，過濾純震盪雜訊"""
+    """【AI 第一關】看圖辨識：寧缺勿濫，精準辨識型態並嚴格按幾何規則回傳畫線座標"""
     plot_df = df.tail(85).copy().reset_index(drop=True)
     pivots = _extract_chart_pivots(plot_df, window=3)
     last_price = float(plot_df["close"].iloc[-1])
     img_b64 = base64.b64encode(raw_chart_bytes).decode("utf-8")
 
-    prompt = f"""你是專業的圖表型態辨識師。請觀察這張 {symbol} ({timeframe} 週期、共 85 根 K 線，最左 bar 0、最右最新收盤 bar 84) 的 K 線圖。
-目前收盤價 {_fmt_price(last_price)}，主要轉折點參考：
+    prompt = f"""你是嚴謹的專業技術分析師，寧缺勿濫，絕不把普通的單邊回檔誤認成型態。
+請觀察這張 {symbol} ({timeframe} 週期、共 85 根 K 線，最左 bar 0、最右最新收盤 bar 84) 的 K 線圖。
+目前收盤價 {_fmt_price(last_price)}，轉折點座標參考（bar 編號與價格）：
 {json.dumps(pivots, ensure_ascii=False)}
 
-請檢查圖中「最右側（最新走勢）」是否出現以下任何型態或結構：
-- 三角收斂 / 末端緊密壓縮 / 旗形 / 楔形（包含近 8-15 根 K 線的小型收斂）
-- M 頭 / W 底 / 頭肩頂 / 頭肩底
-- 通道上下緣測試 / 關鍵支撐壓力突破 / 長影線假跌破或假突破
+請檢查圖中「最右側（最新走勢）」是否真正存在清晰、具幾何對稱性的結構：
+1. **三角收斂 / 楔形 / 通道**：上緣必須至少有 2 個以上高點逐漸壓低（或水平）、且下緣同時有 2 個以上低點逐漸墊高（或水平），兩條線明顯收攏。如果只有 1 個尖頭回檔，絕對不算三角收斂！
+2. **M 頭 / W 底 / 頭肩頂 / 頭肩底**：必須有清楚的兩隻腳或三尊頭肩與頸線。
+3. **關鍵支撐壓力突破 / 假跌破假突破獵取**：K 線明確刺破前期顯著高低點或放量突破。
 
-只有在圖表完全無序震盪時才設 has_pattern = false。若有型態，請挑出 `trend_lines` 座標點畫出結構線（M/W 頭肩回傳 1 條折線，三角或通道回傳 2 條邊緣線）。只回傳純 JSON：
+如果只是普通震盪或單純小回檔，請務必設 has_pattern = false。
+若確認有型態，請嚴格遵守畫線規則回傳 `trend_lines`：
+- 如果是 **三角收斂 / 通道**：必須回傳 **2 條獨立直線**（第 1 條連 2 個高點、第 2 條連 2 個低點，例如 `[[[b1,h1],[84,h2]], [[b3,l1],[84,l2]]]`），絕對不要把高點跟低點混連成鋸齒！
+- 如果是 **M 頭 / W 底 / 頭肩**：回傳 **1 條交替轉折折線**（例如 W 底：高-低-高-低-高，用轉折點精準連出 W 字）。
+
+只回傳純 JSON：
 {{
   "has_pattern": true 或 false,
   "pattern_name": "型態名稱",
