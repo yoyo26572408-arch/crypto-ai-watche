@@ -1,10 +1,11 @@
 """
-Crypto AI Vision Market Watcher（兩段式 AI：看圖找型態 -> 獨立風險評分 -> 畫線推播）
+Crypto AI Vision Market Watcher（兩段式 AI + Telegram 互動體檢報告 + 抗限流版）
 流程：
-  1. 從交易所 (BingX 優先 + Gate 備援) 抓取 30m / 1h / 4h / 1d K 線並繪製圖表
-  2. 【AI 第一關｜看圖辨識】將 K 線圖給 Gemini Vision 看，過濾無序震盪，抓出明確型態
-  3. 【AI 第二關｜風險評分】將命中型態與量價/均線/ATR 數據交給 AI 做獨立風險評分與把關
-  4. 風險評分通過 (risk_score >= MIN_AI_CONFIDENCE) 後，輸出型態名稱、入場點、止損點、止盈點，畫出趨勢線與三條線推播至 Telegram
+  1. 檢查 Telegram 是否有你的新提問（例如傳「狀態」「有沒有出錯」），若有則標記本輪結束後回報完整體檢清單
+  2. 從交易所 (BingX 優先 + Gate 備援) 抓取 30m / 1h / 4h / 1d K 線並繪製圖表
+  3. 【AI 第一關】看圖辨識：抓出清晰型態與趨勢折線，過濾純震盪雜訊
+  4. 【AI 第二關】風控評分：評估風險與量價，通過門檻即畫上趨勢線與入場/止損/止盈推播
+  5. 若你有發問或本輪出現系統錯誤，自動回傳各幣種狀態報告到 Telegram
 """
 
 import argparse
@@ -29,7 +30,7 @@ FALLBACK_EXCHANGE_ID = os.getenv("FALLBACK_EXCHANGE_ID", "gate")
 SYMBOLS = os.getenv("SYMBOLS", "BTC/USDT:USDT,ETH/USDT:USDT,SOL/USDT:USDT,SUI/USDT:USDT,ZEC/USDT:USDT").split(",")
 TIMEFRAMES = os.getenv("TIMEFRAMES", "30m,1h,4h,1d").split(",")
 CANDLE_LIMIT = 200
-MIN_AI_CONFIDENCE = int(os.getenv("MIN_AI_CONFIDENCE", "6"))  # 第二關風險評分最低通過門檻 (1-10)
+MIN_AI_CONFIDENCE = int(os.getenv("MIN_AI_CONFIDENCE", "6"))
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
@@ -206,7 +207,6 @@ def render_chart_png(
     ax_main = axes[0]
     n = len(ohlcv_df)
 
-    # 1. 型態趨勢折線（M 頭、W 底、三角收斂上下緣等）
     if trend_lines:
         for line in trend_lines:
             if not isinstance(line, list) or len(line) < 2:
@@ -222,7 +222,6 @@ def render_chart_png(
             if len(xs) >= 2:
                 ax_main.plot(xs, ys, color="#b2b5be", linewidth=2.0, alpha=0.9, zorder=5)
 
-    # 2. 目標預測箭頭
     if take_profit and take_profit > 0:
         start_y = float(entry) if entry and entry > 0 else last_price
         arrow_color = "#0ecb81" if float(take_profit) >= start_y else "#f6465d"
@@ -234,7 +233,6 @@ def render_chart_png(
             zorder=6,
         )
 
-    # 3. 最高/最低點指引線
     hi_idx = int(plot_df["high"].idxmax())
     hi_val = float(plot_df["high"].iloc[hi_idx])
     lo_idx = int(plot_df["low"].idxmin())
@@ -266,7 +264,6 @@ def render_chart_png(
         fontweight="bold",
     )
 
-    # 4. 止盈 / 入場 / 止損 水平虛線與右側價格標籤框
     right_x = n + 1.5
     lines_to_draw: list[tuple[str, float, str, str, str]] = []
     if take_profit:
@@ -377,6 +374,47 @@ def stage2_score_risk_and_plan(
     ])
 
 
+def check_telegram_user_query() -> str | None:
+    """檢查你在 Telegram 是否傳了新訊息詢問狀態，並自動標記已讀避免重複回覆"""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return None
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
+        resp = requests.get(url, params={"timeout": 2}, timeout=10)
+        resp.raise_for_status()
+        updates = resp.json().get("result", [])
+        if not updates:
+            return None
+
+        max_id = max(u["update_id"] for u in updates)
+        user_msg = None
+        for u in updates:
+            msg = u.get("message") or {}
+            if str(msg.get("chat", {}).get("id", "")) == str(TELEGRAM_CHAT_ID) and msg.get("text"):
+                user_msg = msg["text"].strip()
+
+        # 標記這批訊息已讀，避免下次重複回覆
+        requests.get(url, params={"offset": max_id + 1, "timeout": 1}, timeout=10)
+        return user_msg
+    except Exception as exc:
+        print(f"[Telegram 收訊檢查失敗] {exc}")
+        return None
+
+
+def send_telegram_text(text: str) -> None:
+    """透過 Telegram Bot 發送純文字狀態報告"""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("[模擬文字推播]\n" + text)
+        return
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    resp = requests.post(
+        url,
+        json={"chat_id": TELEGRAM_CHAT_ID, "text": text[:4096], "parse_mode": "HTML", "disable_web_page_preview": True},
+        timeout=15,
+    )
+    resp.raise_for_status()
+
+
 def send_telegram_photo(image_bytes: bytes, caption: str) -> None:
     """透過 Telegram Bot 發送 K 線圖與分析說明"""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
@@ -402,16 +440,24 @@ def is_recently_closed_for_tf(df: pd.DataFrame, timeframe: str) -> bool:
 
 
 def run(ignore_time_window: bool = False) -> None:
+    user_query = check_telegram_user_query()
+    if user_query:
+        print(f"[收到 Telegram 提問] {user_query}")
+
     exchange_cls = getattr(ccxt, EXCHANGE_ID)
     exchange = exchange_cls({"enableRateLimit": True})
     fallback_cls = getattr(ccxt, FALLBACK_EXCHANGE_ID, None)
     fallback_exchange = fallback_cls({"enableRateLimit": True}) if fallback_cls else None
     tz_tw = timezone(timedelta(hours=8))
 
+    status_lines: list[str] = []
+    error_lines: list[str] = []
+
     for raw_symbol in SYMBOLS:
         symbol = raw_symbol.strip()
         if not symbol:
             continue
+        short_sym = symbol.split("/")[0]
         for raw_tf in TIMEFRAMES:
             tf = raw_tf.strip()
             if not tf:
@@ -419,22 +465,21 @@ def run(ignore_time_window: bool = False) -> None:
             try:
                 time.sleep(0.4)
                 df = fetch_ohlcv(exchange, symbol, tf, limit=CANDLE_LIMIT, fallback_exchange=fallback_exchange)
-                if not ignore_time_window and not is_recently_closed_for_tf(df, tf):
-                    print(f"[跳過] {symbol} {tf} 非剛收盤的 K 線，避免重複通知")
+                # 若使用者主動在 Telegram 詢問狀態，強制掃描所有週期以便回報最新情況
+                if not ignore_time_window and not user_query and not is_recently_closed_for_tf(df, tf):
                     continue
 
                 df = add_indicators(df)
                 raw_chart = render_chart_png(df, symbol, tf)
 
-                # 第一關：AI 看圖找型態並過濾無結構雜訊
                 s1 = stage1_detect_pattern_from_chart(symbol, tf, df, raw_chart)
                 if not s1.get("has_pattern"):
+                    msg_line = f"• <b>{short_sym} ({tf})</b>：無明確型態"
+                    status_lines.append(msg_line)
                     print(f"[第一關過濾] {symbol} {tf} 無明確型態")
                     continue
 
                 print(f"[第一關命中] {symbol} {tf}: {s1.get('pattern_name')} ({s1.get('bias')})")
-
-                # 第二關：交給 AI 進行風險評分與規劃入場/止損/止盈
                 s2 = stage2_score_risk_and_plan(symbol, tf, df, raw_chart, s1)
                 risk_score = int(s2.get("risk_score", 0))
 
@@ -462,12 +507,34 @@ def run(ignore_time_window: bool = False) -> None:
                         f"• <b>AI 分析</b>：{s2.get('summary')}"
                     )
                     send_telegram_photo(marked_chart, msg)
+                    status_lines.append(f"• <b>{short_sym} ({tf})</b>：✅ 已發圖（{s1.get('pattern_name')}，{risk_score}/10）")
                     print(f"[第二關通過已推播] {symbol} {tf}: 評分 {risk_score}/10")
                 else:
-                    print(f"[第二關風險過濾] {symbol} {tf} {s1.get('pattern_name')} 評分僅 {risk_score}/10（低於門檻 {MIN_AI_CONFIDENCE}）")
+                    status_lines.append(
+                        f"• <b>{short_sym} ({tf})</b>：🟡 有「{s1.get('pattern_name')}」但風險評分 {risk_score}/10（未達 {MIN_AI_CONFIDENCE} 分）"
+                    )
+                    print(f"[第二關風險過濾] {symbol} {tf} {s1.get('pattern_name')} 評分僅 {risk_score}/10")
 
             except Exception as exc:
+                err_msg = f"• <b>{short_sym} ({tf})</b>：❌ 錯誤（{str(exc)[:80]}）"
+                status_lines.append(err_msg)
+                error_lines.append(err_msg)
                 print(f"[錯誤] {symbol} {tf} 處理失敗: {exc}")
+
+    # 若你在 Telegram 傳訊詢問，或本輪有發生系統錯誤，主動回傳一份體檢總結
+    if user_query or error_lines:
+        now_tw = datetime.now(tz_tw).strftime("%m-%d %H:%M")
+        header = (
+            f"📋 <b>盯盤系統體檢回報（{now_tw} UTC+8）</b>\n"
+            f"目前門檻：風險評分 ≥ <b>{MIN_AI_CONFIDENCE}/10</b>\n"
+        )
+        if user_query:
+            header += f"收到你的訊息：「<i>{user_query[:30]}</i>」\n\n"
+        else:
+            header += "⚠️ <b>偵測到部分項目異常：</b>\n\n"
+
+        body = "\n".join(status_lines) if status_lines else "本輪無剛收盤的週期。"
+        send_telegram_text(header + body)
 
 
 if __name__ == "__main__":
