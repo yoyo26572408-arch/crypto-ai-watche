@@ -200,11 +200,15 @@ def _extract_chart_pivots(plot_df: pd.DataFrame, window: int = 3) -> list[dict[s
 
 
 def _call_gemini(parts: list[dict[str, Any]]) -> dict[str, Any]:
-    """快速呼叫 Gemini API，遇 429/503/Timeout 迅速退避或切換備用模型"""
+    """抗塞車版：自動切換多組備援模型 + 拉長退避等待時間"""
     if not GEMINI_API_KEY:
         raise RuntimeError("請設定 GEMINI_API_KEY")
 
-    models_to_try = [GEMINI_MODEL, "gemini-3.5-flash-lite"]
+    models_to_try = [
+        GEMINI_MODEL,
+        "gemini-2.5-flash",
+        "gemini-2.5-flash-lite",
+    ]
     last_exc: Exception | None = None
     for model_name in dict.fromkeys(models_to_try):
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={GEMINI_API_KEY}"
@@ -212,16 +216,16 @@ def _call_gemini(parts: list[dict[str, Any]]) -> dict[str, Any]:
             "contents": [{"parts": parts}],
             "generationConfig": {"responseMimeType": "application/json"},
         }
-        for attempt in range(1, 4):
-            time.sleep(0.6)
+        for attempt in range(1, 3):
+            time.sleep(2.0)  # 每次請求前先停 2 秒，避免連打被限流
             try:
-                resp = requests.post(url, json=payload, timeout=(10, 65))
+                resp = requests.post(url, json=payload, timeout=(10, 60))
                 if resp.status_code == 404:
                     last_exc = requests.HTTPError(f"404 Not Found for {model_name}", response=resp)
                     break
                 if resp.status_code in (429, 500, 502, 503, 504):
                     last_exc = requests.HTTPError(f"{resp.status_code} for {model_name}", response=resp)
-                    wait_sec = 2 * attempt
+                    wait_sec = 5 * attempt  # 遇塞車等 5 秒、10 秒再試
                     print(f"[Gemini {resp.status_code}] 等待 {wait_sec}s 重試或切換備用模型...")
                     time.sleep(wait_sec)
                     continue
@@ -235,7 +239,7 @@ def _call_gemini(parts: list[dict[str, Any]]) -> dict[str, Any]:
                 raise ValueError("Gemini 回傳非預期的 JSON 格式")
             except (requests.exceptions.RequestException, json.JSONDecodeError, KeyError, IndexError, ValueError) as exc:
                 last_exc = exc
-                time.sleep(2 * attempt)
+                time.sleep(5 * attempt)
 
     raise last_exc or RuntimeError("Gemini API 呼叫失敗")
 
