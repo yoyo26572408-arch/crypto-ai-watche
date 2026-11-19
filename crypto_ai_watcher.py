@@ -1,5 +1,5 @@
 """
-Crypto AI Vision Market Watcher（嚴格全型態校驗 + 8/10 高勝率特殊標記版）
+Crypto AI Vision Market Watcher（極速省時 + 8/10 高勝率標記 + 風險對齊建議槓桿倍率版）
 """
 
 import argparse
@@ -27,6 +27,7 @@ SYMBOLS = os.getenv("SYMBOLS", "BTC/USDT:USDT,ETH/USDT:USDT,SOL/USDT:USDT,SUI/US
 TIMEFRAMES = os.getenv("TIMEFRAMES", "30m,1h,4h,1d").split(",")
 CANDLE_LIMIT = 200
 MIN_AI_CONFIDENCE = int(os.getenv("MIN_AI_CONFIDENCE", "6"))
+MAX_MARGIN_LOSS_PCT = float(os.getenv("MAX_MARGIN_LOSS_PCT", "0.15"))  # 單筆止損預計虧損保證金比例 (預設 15%)
 HISTORY_FILE = Path("sent_history.json")
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
@@ -53,20 +54,33 @@ def save_history(history: dict[str, Any]) -> None:
     HISTORY_FILE.write_text(json.dumps(history, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def is_in_cooldown(history: dict[str, Any], symbol: str, tf: str, bias: str, entry: float) -> bool:
-    """檢查同一幣種與週期是否在冷卻期內（避免連續兩次跳出一模一樣的型態）"""
+def is_in_cooldown_precheck(history: dict[str, Any], symbol: str, tf: str, current_price: float | None = None) -> tuple[bool, str]:
+    """在呼叫 AI 之前先檢查冷卻狀態，冷卻中直接跳過，省下大量等待時間"""
     key = f"{symbol}|{tf}"
     rec = history.get(key)
     if not isinstance(rec, dict):
-        return False
+        return False, ""
     elapsed_hours = (time.time() - float(rec.get("ts", 0))) / 3600
     cooldown_h = COOLDOWN_HOURS_MAP.get(tf, 3)
     if elapsed_hours >= cooldown_h:
-        return False
-    same_bias = rec.get("bias") == bias
+        return False, ""
     last_entry = float(rec.get("entry", 0))
-    similar_price = last_entry > 0 and abs(entry - last_entry) / last_entry <= 0.015
-    return same_bias and similar_price
+    if current_price and last_entry > 0 and abs(current_price - last_entry) / last_entry > 0.02:
+        return False, ""
+    return True, str(rec.get("pattern") or "已推播結構")
+
+
+def _suggest_leverage(entry: float, stop_loss: float) -> tuple[int, float, float]:
+    """依止損距離計算建議槓桿倍率（控制打損約虧保證金 15%，限制在 2x ~ 20x 之間）"""
+    if entry <= 0:
+        return 5, 0.0, 0.0
+    sl_pct = abs(entry - stop_loss) / entry
+    if sl_pct <= 0.001:
+        sl_pct = 0.01
+    raw_lev = int(MAX_MARGIN_LOSS_PCT / sl_pct)
+    lev = max(2, min(20, raw_lev))
+    est_margin_loss_pct = sl_pct * lev * 100
+    return lev, sl_pct * 100, est_margin_loss_pct
 
 
 def fetch_ohlcv(
@@ -76,9 +90,9 @@ def fetch_ohlcv(
     limit: int = 200,
     fallback_exchange: ccxt.Exchange | None = None,
 ) -> pd.DataFrame:
-    """抓取 K 線資料，遇限流自動重試 3 次，仍失敗則自動切換備援交易所"""
+    """抓取 K 線資料，遇限流自動重試 2 次，仍失敗則切換備援交易所"""
     last_err: Exception | None = None
-    for attempt in range(1, 4):
+    for attempt in range(1, 3):
         try:
             ohlcv = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
             df = pd.DataFrame(ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"])
@@ -88,8 +102,8 @@ def fetch_ohlcv(
             return df
         except Exception as exc:
             last_err = exc
-            print(f"[重試 {attempt}/3] {exchange.id} 抓取 {symbol} {timeframe} 失敗: {exc}")
-            time.sleep(2 * attempt)
+            print(f"[重試 {attempt}/2] {exchange.id} 抓取 {symbol} {timeframe} 失敗: {exc}")
+            time.sleep(1.5 * attempt)
 
     if fallback_exchange is not None:
         print(f"[切換備援] 改用 {fallback_exchange.id} 抓取 {symbol} {timeframe}")
@@ -145,7 +159,7 @@ def _extract_chart_pivots(plot_df: pd.DataFrame, window: int = 3) -> list[dict[s
 
 
 def _call_gemini(parts: list[dict[str, Any]]) -> dict[str, Any]:
-    """呼叫 Gemini API，遇 429/503/Timeout 自動退避重試，並安全解析 JSON"""
+    """快速呼叫 Gemini API，遇 429/503/Timeout 迅速退避或切換備用模型"""
     if not GEMINI_API_KEY:
         raise RuntimeError("請設定 GEMINI_API_KEY")
 
@@ -157,17 +171,17 @@ def _call_gemini(parts: list[dict[str, Any]]) -> dict[str, Any]:
             "contents": [{"parts": parts}],
             "generationConfig": {"responseMimeType": "application/json"},
         }
-        for attempt in range(1, 4):
-            time.sleep(1.5)
+        for attempt in range(1, 3):
+            time.sleep(0.6)
             try:
-                resp = requests.post(url, json=payload, timeout=60)
+                resp = requests.post(url, json=payload, timeout=35)
                 if resp.status_code == 404:
                     last_exc = requests.HTTPError(f"404 Not Found for {model_name}", response=resp)
                     break
                 if resp.status_code in (429, 500, 502, 503, 504):
                     last_exc = requests.HTTPError(f"{resp.status_code} for {model_name}", response=resp)
-                    wait_sec = 4 * attempt
-                    print(f"[Gemini {resp.status_code}] 等待 {wait_sec}s 後重試 ({attempt}/3)...")
+                    wait_sec = 2 * attempt
+                    print(f"[Gemini {resp.status_code}] 等待 {wait_sec}s 重試或切換備用模型...")
                     time.sleep(wait_sec)
                     continue
                 resp.raise_for_status()
@@ -180,9 +194,7 @@ def _call_gemini(parts: list[dict[str, Any]]) -> dict[str, Any]:
                 raise ValueError("Gemini 回傳非預期的 JSON 格式")
             except (requests.exceptions.RequestException, json.JSONDecodeError, KeyError, IndexError, ValueError) as exc:
                 last_exc = exc
-                wait_sec = 4 * attempt
-                print(f"[Gemini 異常/逾時] {exc}，等待 {wait_sec}s 後重試 ({attempt}/3)...")
-                time.sleep(wait_sec)
+                time.sleep(2 * attempt)
 
     raise last_exc or RuntimeError("Gemini API 呼叫失敗")
 
@@ -286,7 +298,6 @@ def render_chart_png(
     ax_main = axes[0]
     n = len(ohlcv_df)
 
-    # 8/10 以上高勝率金色專屬徽章
     if is_high_prob:
         ax_main.text(
             0.015,
@@ -466,7 +477,7 @@ def stage2_score_risk_and_plan(
 {candles_text}
 
 請同時對照 K 線圖與量價數據進行嚴格風險評估：
-1. 評估結構是否紮實、有無逆勢撞均線、量能配合與止損位置合理性，給出 `risk_score`（1 到 10 的整數，8 分以上代表極高勝率 80%+ 優質機會）。
+1. 評估是否有逆勢撞均線、量能背離、止損位置合理性，給出 `risk_score`（1 到 10 的整數，8 分以上代表極高勝率 80%+ 優質機會）。
 2. 給出具體的 `entry`（入場點）、`stop_loss`（止損點）、`take_profit`（止盈點，風報比至少 1:1.8）。
 
 只回傳純 JSON：
@@ -570,7 +581,12 @@ def run(ignore_time_window: bool = False) -> None:
             if not tf:
                 continue
             try:
-                time.sleep(0.4)
+                in_cd_pre, prev_pat = is_in_cooldown_precheck(history, symbol, tf)
+                if in_cd_pre:
+                    status_lines.append(f"• <b>{short_sym} ({tf})</b>：⏳ 冷卻中（{html.escape(prev_pat)}，略過掃描）")
+                    print(f"[冷卻跳過] {symbol} {tf} 直接跳過 AI 掃描")
+                    continue
+
                 df = fetch_ohlcv(exchange, symbol, tf, limit=CANDLE_LIMIT, fallback_exchange=fallback_exchange)
                 if not ignore_time_window and not user_query and not is_recently_closed_for_tf(df, tf):
                     continue
@@ -601,15 +617,11 @@ def run(ignore_time_window: bool = False) -> None:
                     sl_p = float(s2.get("stop_loss") or last_price * 0.98)
                     tp_p = float(s2.get("take_profit") or last_price * 1.04)
 
-                    if is_in_cooldown(history, symbol, tf, str(s1.get("bias")), entry_p):
-                        status_lines.append(f"• <b>{short_sym} ({tf})</b>：⏳ 同結構冷卻中（{pat_name}，不重複發圖）")
-                        print(f"[冷卻略過] {symbol} {tf} 與上次通知相同，略過重複發圖")
-                        continue
-
                     risk = abs(entry_p - sl_p)
                     rr = abs(tp_p - entry_p) / risk if risk > 0 else 0
+                    lev, sl_dist_pct, margin_loss_pct = _suggest_leverage(entry_p, sl_p)
                     risk_lvl = html.escape(str(s2.get("risk_level") or ""))
-                    summary_safe = html.escape(str(s2.get("summary") or "")[:320])
+                    summary_safe = html.escape(str(s2.get("summary") or "")[:300])
 
                     marked_chart = render_chart_png(
                         df, symbol, tf,
@@ -632,6 +644,7 @@ def run(ignore_time_window: bool = False) -> None:
                         + score_line
                         + f"• <b>現價</b>：{_fmt_price(last_price)}（收盤 {candle_tw} UTC+8）\n"
                         + f"• <b>參考規劃</b>：入場 <code>{_fmt_price(entry_p)}</code> ｜ 止損 <code>{_fmt_price(sl_p)}</code> ｜ 止盈 <code>{_fmt_price(tp_p)}</code>（R:R ≈ 1:{rr:.1f}）\n"
+                        + f"• <b>建議倍率</b>：<code>{lev}x</code>（止損距離 {sl_dist_pct:.2f}%，打損約虧保證金 {margin_loss_pct:.0f}%）\n"
                         + f"• <b>AI 分析</b>：{summary_safe}"
                     )
                     send_telegram_photo(marked_chart, msg)
@@ -643,7 +656,7 @@ def run(ignore_time_window: bool = False) -> None:
                     }
                     save_history(history)
                     status_lines.append(f"• <b>{short_sym} ({tf})</b>：{status_badge}")
-                    print(f"[第二關通過已推播] {symbol} {tf}: 評分 {risk_score}/10")
+                    print(f"[第二關通過已推播] {symbol} {tf}: 評分 {risk_score}/10, 建議 {lev}x")
                 else:
                     status_lines.append(
                         f"• <b>{short_sym} ({tf})</b>：🟡 有「{pat_name}」但風險評分 {risk_score}/10（未達 {MIN_AI_CONFIDENCE} 分）"
