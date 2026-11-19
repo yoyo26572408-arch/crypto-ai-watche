@@ -1,4 +1,4 @@
-"""Gemini K-line watcher v2.1. Standalone; local output only, no Telegram connection."""
+"""Gemini K-line watcher v2.2. Standalone; auto model selection; no Telegram connection."""
 from __future__ import annotations
 
 # --- watcher_stats.py ---
@@ -219,7 +219,8 @@ def settings():
                min_score=int(os.getenv("MIN_AI_CONFIDENCE", "8")),
                min_samples=int(os.getenv("MIN_SAMPLES", "100")),
                threshold=float(os.getenv("SUCCESS_THRESHOLD", "0.80")),
-               key=os.getenv("GEMINI_API_KEY", ""), model=os.getenv("GEMINI_MODEL", ""),
+               key=(os.getenv("GEMINI_API_KEY", "").strip() or os.getenv("GOOGLE_API_KEY", "").strip()),
+               model=os.getenv("GEMINI_MODEL", "").strip().removeprefix("models/"),
                state_dir=ROOT / os.getenv("STATE_DIR", "state"))
     if cfg["exchange"] not in {"bingx", "binanceusdm"} or cfg["fallback"] not in {"bingx", "binanceusdm"}:
         raise ValueError("EXCHANGE_ID / FALLBACK_EXCHANGE_ID 只支援 bingx 或 binanceusdm")
@@ -268,7 +269,7 @@ def single_instance(folder):
 
 def list_models(cfg):
     if not cfg["key"]:
-        raise ValueError("請先在 .env 設定 GEMINI_API_KEY")
+        raise ValueError("未收到 GEMINI_API_KEY（或 GOOGLE_API_KEY）。GitHub Actions 必須用 env 將 secrets 注入執行步驟；只有建立 Secret 不會自動成為環境變數。")
     models, page = [], None
     while True:
         response = requests.get("https://generativelanguage.googleapis.com/v1beta/models",
@@ -284,13 +285,74 @@ def list_models(cfg):
             return sorted(models)
 
 
+class GeminiRequestError(RuntimeError):
+    def __init__(self, status):
+        self.status = status
+        super().__init__(f"Gemini HTTP {status}；請檢查模型／權限／用量。")
+
+
+def model_candidates(models):
+    # The listing is authoritative for existence, but it does not promise vision
+    # or JSON support. A small image+JSON preflight below verifies both.
+    excluded = ("image", "audio", "tts", "live", "native", "embedding", "robotics", "computer-use")
+    candidates = [m for m in models if m.startswith("gemini-") and "flash" in m
+                  and not any(word in m.lower() for word in excluded)]
+    def rank(name):
+        match = re.match(r"gemini-(\d+)(?:\.(\d+))?", name)
+        version = (int(match[1]), int(match[2] or 0)) if match else (0, 0)
+        return ("lite" in name, any(x in name for x in ("preview", "exp")),
+                -version[0], -version[1], name)
+    return sorted(candidates, key=rank)
+
+
 def verify_model(cfg):
-    if not cfg["model"]:
-        raise ValueError("請先執行 --list-models，並將可用的看圖模型填入 .env 的 GEMINI_MODEL")
-    if not re.fullmatch(r"[A-Za-z0-9._-]+", cfg["model"]):
+    models = list_models(cfg)
+    explicit = cfg["model"].lower() not in {"", "auto"}
+    if explicit and not re.fullmatch(r"[A-Za-z0-9._-]+", cfg["model"]):
         raise ValueError("GEMINI_MODEL 格式不正確")
-    if cfg["model"] not in list_models(cfg):
-        raise ValueError("此 GEMINI_MODEL 不在你的可用 generateContent 模型清單中")
+    if explicit and cfg["model"] not in models:
+        raise ValueError("指定的 GEMINI_MODEL 不在此 Key 的可用清單；可改成 auto 由程式選擇")
+    pin_path = cfg["state_dir"] / "model_choice.json"
+    account = hashlib.sha256(cfg["key"].encode()).hexdigest()
+    try:
+        pinned = json.loads(pin_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        pinned = {}
+    candidates = [cfg["model"]] if explicit else model_candidates(models)
+    if (pinned.get("account") == account and pinned.get("model") in models and
+        pinned.get("vision_json_verified") is True and
+        (not explicit or pinned.get("model") == cfg["model"])):
+        cfg["model"] = pinned["model"]
+        print(f"[Gemini] 使用已驗證模型：{cfg['model']}", flush=True)
+        return cfg["model"]
+    if not candidates:
+        raise ValueError("此 Key 沒有可自動選用的 Flash 模型；請用 --list-models 查看並明確設定 GEMINI_MODEL")
+    # A valid 16x16 PNG; the preflight consumes a small API request once per
+    # newly selected model/account. Do not silently try other accounts or quota pools.
+    parts = [{"text": 'Check image input and JSON output. Reply with exactly {"ready":true}.'},
+             {"inlineData": {"mimeType": "image/png", "data":
+              "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAIAAACQkWg2AAAAI0lEQVR4nGP8//8/AymAiSTVDKMaiANMRKqDg1ENxACSQwkAVW0DHeN02ZEAAAAASUVORK5CYII="}}]
+    for candidate in candidates[:5]:
+        cfg["model"] = candidate
+        try:
+            result = call_gemini(cfg, parts)
+            if result.get("ready") is not True:
+                raise ValueError("看圖／JSON 測試未通過")
+        except GeminiRequestError as exc:
+            if not explicit and exc.status in {400, 404}:
+                continue
+            raise
+        except ValueError:
+            if not explicit:
+                continue
+            raise
+        cfg["state_dir"].mkdir(parents=True, exist_ok=True)
+        temporary = pin_path.with_suffix(".json.tmp")
+        temporary.write_text(json.dumps(dict(model=candidate, account=account, vision_json_verified=True)), encoding="utf-8")
+        temporary.replace(pin_path)
+        print(f"[Gemini] 已選定並驗證看圖／JSON：{candidate}", flush=True)
+        return candidate
+    raise ValueError("可用 Flash 模型均未通過看圖／JSON 測試，請查看模型權限或明確設定 GEMINI_MODEL")
 
 
 def call_gemini(cfg, parts):
@@ -309,7 +371,7 @@ def call_gemini(cfg, parts):
             time.sleep(min(30, 5 * (attempt + 1)))
             continue
         if response.status_code != 200:
-            raise RuntimeError(f"Gemini HTTP {response.status_code}（未自動切換模型，以保持統計一致）")
+            raise GeminiRequestError(response.status_code)
         try:
             candidate = response.json()["candidates"][0]
             if candidate.get("finishReason") != "STOP":
@@ -567,8 +629,9 @@ def run_watcher(chart_module, watch=False, interval=60, track_only=False):
 def show_status():
     cfg = settings()
     print("設定狀態（不顯示金鑰）")
-    for field in ("key", "model"):
+    for field in ("key",):
         print(f"{field}: {'已設定' if cfg[field] else '未設定'}")
+    print(f"model: {cfg['model'] or 'auto（首次執行時自動選擇）'}")
     path = cfg["state_dir"] / "signals.sqlite3"
     if path.exists():
         ledger = Ledger(path)
@@ -1010,6 +1073,7 @@ def main():
     modes.add_argument("--watch", action="store_true", help="持續輪詢；Ctrl+C 停止")
     modes.add_argument("--status", action="store_true", help="顯示設定及模擬紀錄統計")
     modes.add_argument("--list-models", action="store_true", help="查詢此 API Key 可用模型")
+    modes.add_argument("--check-config", action="store_true", help="驗證 Key、選定模型並測試圖片／JSON（可能產生少量 API 用量）")
     modes.add_argument("--download-only", action="store_true", help="只下載行情 CSV")
     parser.add_argument("--track-only", action="store_true", help="只結算已有模擬訊號，不呼叫 Gemini")
     parser.add_argument("--interval", type=int, default=60)
@@ -1019,6 +1083,9 @@ def main():
         show_status()
     elif args.list_models:
         print("\n".join(list_models(cfg)))
+    elif args.check_config:
+        verify_model(cfg)
+        print("Gemini 設定檢查通過；沒有啟動盯盤或通知。")
     elif args.download_only:
         download_market_data(args.output)
     else:
@@ -1036,5 +1103,5 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print("已停止；模擬紀錄已保存在本機。")
     except Exception as exc:
-        print("啟動失敗：" + safe_error(exc, {"key": os.getenv("GEMINI_API_KEY")}))
+        print("啟動失敗：" + safe_error(exc, {"key": os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")}))
         raise SystemExit(1)
