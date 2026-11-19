@@ -1,9 +1,16 @@
 """
-Crypto AI Vision Market Watcher（Gemini 3.6 Flash 兩段式 AI + 抗 503/429/Timeout 重試 + 冷卻防重複版）
+Crypto AI Vision Market Watcher（全面防呆強化版）
+修正重點：
+  1. HTML 跳脫與安全截斷：AI 文字含 < / > 或過長時不會導致 Telegram 400 傳送失敗
+  2. JSON 結構容錯：AI 偶爾回傳單元素 list 時自動解包，不崩潰
+  3. 價位合理性校驗 ＋ 右側 TP/Entry/SL 標籤防重疊錯位
+  4. 詢問「狀態」時一樣遵守冷卻機制，不洗版重複發圖
+  5. Gemini 429/503/ReadTimeout 自動重試 ＋ BingX 100410 重試與 Gate 備援
 """
 
 import argparse
 import base64
+import html
 import io
 import json
 import os
@@ -41,7 +48,8 @@ COOLDOWN_HOURS_MAP = {"15m": 2, "30m": 3, "1h": 6, "4h": 16, "1d": 48}
 def load_history() -> dict[str, Any]:
     if HISTORY_FILE.exists():
         try:
-            return json.loads(HISTORY_FILE.read_text(encoding="utf-8"))
+            data = json.loads(HISTORY_FILE.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
         except Exception:
             return {}
     return {}
@@ -55,7 +63,7 @@ def is_in_cooldown(history: dict[str, Any], symbol: str, tf: str, bias: str, ent
     """檢查同一幣種與週期是否在冷卻期內（避免連續兩次跳出一模一樣的型態）"""
     key = f"{symbol}|{tf}"
     rec = history.get(key)
-    if not rec:
+    if not isinstance(rec, dict):
         return False
     elapsed_hours = (time.time() - float(rec.get("ts", 0))) / 3600
     cooldown_h = COOLDOWN_HOURS_MAP.get(tf, 3)
@@ -143,7 +151,7 @@ def _extract_chart_pivots(plot_df: pd.DataFrame, window: int = 3) -> list[dict[s
 
 
 def _call_gemini(parts: list[dict[str, Any]]) -> dict[str, Any]:
-    """呼叫 Gemini API，遇 429/503 或 ReadTimeout 自動退避重試，並支援備用模型"""
+    """呼叫 Gemini API，遇 429/503/Timeout 自動退避重試，並安全解析 JSON"""
     if not GEMINI_API_KEY:
         raise RuntimeError("請設定 GEMINI_API_KEY")
 
@@ -156,7 +164,7 @@ def _call_gemini(parts: list[dict[str, Any]]) -> dict[str, Any]:
             "generationConfig": {"responseMimeType": "application/json"},
         }
         for attempt in range(1, 4):
-            time.sleep(2.0)
+            time.sleep(1.5)
             try:
                 resp = requests.post(url, json=payload, timeout=60)
                 if resp.status_code == 404:
@@ -170,11 +178,16 @@ def _call_gemini(parts: list[dict[str, Any]]) -> dict[str, Any]:
                     continue
                 resp.raise_for_status()
                 text = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
-                return json.loads(text)
-            except requests.exceptions.RequestException as exc:
+                parsed = json.loads(text)
+                if isinstance(parsed, list) and parsed and isinstance(parsed[0], dict):
+                    return parsed[0]
+                if isinstance(parsed, dict):
+                    return parsed
+                raise ValueError("Gemini 回傳非預期的 JSON 格式")
+            except (requests.exceptions.RequestException, json.JSONDecodeError, KeyError, IndexError, ValueError) as exc:
                 last_exc = exc
                 wait_sec = 4 * attempt
-                print(f"[Gemini 連線逾時/錯誤] {exc}，等待 {wait_sec}s 後重試 ({attempt}/3)...")
+                print(f"[Gemini 異常/逾時] {exc}，等待 {wait_sec}s 後重試 ({attempt}/3)...")
                 time.sleep(wait_sec)
 
     raise last_exc or RuntimeError("Gemini API 呼叫失敗")
@@ -189,7 +202,7 @@ def render_chart_png(
     take_profit: float | None = None,
     trend_lines: list[list[list[float]]] | None = None,
 ) -> bytes:
-    """繪製仿 BingX / TradingView 風格 K 線圖"""
+    """繪製仿 BingX / TradingView 風格 K 線圖（含防標籤重疊與極端值保護）"""
     if "ema20" not in df.columns:
         df = add_indicators(df.copy())
 
@@ -229,13 +242,29 @@ def render_chart_png(
         mpf.make_addplot(plot_df_idx["ema50"], color="#ffa726", width=0.9, panel=0),
     ]
 
+    chart_min = float(plot_df["low"].min())
+    chart_max = float(plot_df["high"].max())
     last_price = float(ohlcv_df["Close"].iloc[-1])
-    all_y = [float(plot_df["low"].min()), float(plot_df["high"].max())]
-    for v in (entry, stop_loss, take_profit):
-        if v is not None and v > 0:
-            all_y.append(float(v))
+
+    # 過濾掉 AI 偶爾產生的極端異常價位，避免壓扁整個 K 線圖
+    def _valid_price(v: float | None) -> float | None:
+        if v is None or v <= 0:
+            return None
+        if chart_min * 0.8 <= float(v) <= chart_max * 1.2:
+            return float(v)
+        return None
+
+    entry_v = _valid_price(entry)
+    sl_v = _valid_price(stop_loss)
+    tp_v = _valid_price(take_profit)
+
+    all_y = [chart_min, chart_max]
+    for v in (entry_v, sl_v, tp_v):
+        if v is not None:
+            all_y.append(v)
     y_min, y_max = min(all_y), max(all_y)
-    y_pad = (y_max - y_min) * 0.08 if y_max > y_min else y_max * 0.02
+    y_pad = (y_max - y_min) * 0.09 if y_max > y_min else y_max * 0.02
+    y_lo, y_hi = y_min - y_pad, y_max + y_pad
 
     buf = io.BytesIO()
     fig, axes = mpf.plot(
@@ -248,7 +277,7 @@ def render_chart_png(
         title=f"{symbol}  ·  {timeframe}  (UTC+8)",
         figsize=(12.5, 7),
         xlim=(-1, len(ohlcv_df) + 18),
-        ylim=(y_min - y_pad, y_max + y_pad),
+        ylim=(y_lo, y_hi),
         returnfig=True,
         tight_layout=True,
     )
@@ -256,7 +285,8 @@ def render_chart_png(
     ax_main = axes[0]
     n = len(ohlcv_df)
 
-    if trend_lines:
+    # 1. 畫型態結構線（只畫在合理價格範圍內的點）
+    if isinstance(trend_lines, list):
         for line in trend_lines:
             if not isinstance(line, list) or len(line) < 2:
                 continue
@@ -265,23 +295,25 @@ def render_chart_png(
                 if isinstance(pt, (list, tuple)) and len(pt) == 2:
                     bx = max(0.0, min(float(n - 1), float(pt[0])))
                     py = float(pt[1])
-                    if py > 0:
+                    if chart_min * 0.85 <= py <= chart_max * 1.15:
                         xs.append(bx)
                         ys.append(py)
             if len(xs) >= 2:
                 ax_main.plot(xs, ys, color="#b2b5be", linewidth=2.0, alpha=0.9, zorder=5)
 
-    if take_profit and take_profit > 0:
-        start_y = float(entry) if entry and entry > 0 else last_price
-        arrow_color = "#0ecb81" if float(take_profit) >= start_y else "#f6465d"
+    # 2. 目標預測箭頭
+    if tp_v is not None:
+        start_y = entry_v if entry_v is not None else last_price
+        arrow_color = "#0ecb81" if tp_v >= start_y else "#f6465d"
         ax_main.annotate(
             "",
-            xy=(n + 7, float(take_profit)),
+            xy=(n + 7, tp_v),
             xytext=(n - 1, start_y),
             arrowprops=dict(arrowstyle="->,head_width=0.45,head_length=0.6", color=arrow_color, lw=2.0, alpha=0.95),
             zorder=6,
         )
 
+    # 3. 最高/最低點指引線
     hi_idx = int(plot_df["high"].idxmax())
     hi_val = float(plot_df["high"].iloc[hi_idx])
     lo_idx = int(plot_df["low"].idxmin())
@@ -313,30 +345,38 @@ def render_chart_png(
         fontweight="bold",
     )
 
+    # 4. 畫出 止盈 / 入場 / 止損 水平虛線，並對右側價格框做防重疊錯位
     right_x = n + 1.5
     lines_to_draw: list[tuple[str, float, str, str, str]] = []
-    if take_profit:
-        lines_to_draw.append(("TP", float(take_profit), "#0ecb81", "#0c261d", "--"))
-    if entry:
-        lines_to_draw.append(("Entry", float(entry), "#eaecef", "#1e2329", "-."))
-    if stop_loss:
-        lines_to_draw.append(("SL", float(stop_loss), "#f6465d", "#2c1117", "--"))
+    if tp_v is not None:
+        lines_to_draw.append(("TP", tp_v, "#0ecb81", "#0c261d", "--"))
+    if entry_v is not None:
+        lines_to_draw.append(("Entry", entry_v, "#eaecef", "#1e2329", "-."))
+    if sl_v is not None:
+        lines_to_draw.append(("SL", sl_v, "#f6465d", "#2c1117", "--"))
 
-    for label, price_val, edge_col, bg_col, ls in lines_to_draw:
-        ax_main.axhline(price_val, color=edge_col, linestyle=ls, linewidth=1.2, alpha=0.95)
-        ax_main.text(
-            right_x,
-            price_val,
-            f" {label} {_fmt_price(price_val)} ",
-            color=edge_col,
-            fontsize=9,
-            va="center",
-            ha="left",
-            fontweight="bold",
-            bbox=dict(boxstyle="round,pad=0.22", facecolor=bg_col, edgecolor=edge_col, linewidth=1),
-        )
-
-    if not entry:
+    if lines_to_draw:
+        lines_to_draw.sort(key=lambda item: item[1])
+        min_gap = (y_hi - y_lo) * 0.06
+        placed_ys: list[float] = []
+        for label, price_val, edge_col, bg_col, ls in lines_to_draw:
+            ax_main.axhline(price_val, color=edge_col, linestyle=ls, linewidth=1.2, alpha=0.95)
+            label_y = price_val
+            if placed_ys and (label_y - placed_ys[-1]) < min_gap:
+                label_y = placed_ys[-1] + min_gap
+            placed_ys.append(label_y)
+            ax_main.text(
+                right_x,
+                label_y,
+                f" {label} {_fmt_price(price_val)} ",
+                color=edge_col,
+                fontsize=9,
+                va="center",
+                ha="left",
+                fontweight="bold",
+                bbox=dict(boxstyle="round,pad=0.22", facecolor=bg_col, edgecolor=edge_col, linewidth=1),
+            )
+    else:
         ax_main.plot([n - 1, n + 1.2], [last_price, last_price], color="#eaecef", linestyle=":", linewidth=1.0)
         ax_main.text(
             right_x,
@@ -461,7 +501,7 @@ def send_telegram_text(text: str) -> None:
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     resp = requests.post(
         url,
-        json={"chat_id": TELEGRAM_CHAT_ID, "text": text[:4096], "parse_mode": "HTML", "disable_web_page_preview": True},
+        json={"chat_id": TELEGRAM_CHAT_ID, "text": text[:4000], "parse_mode": "HTML", "disable_web_page_preview": True},
         timeout=15,
     )
     resp.raise_for_status()
@@ -486,7 +526,7 @@ def is_recently_closed_for_tf(df: pd.DataFrame, timeframe: str) -> bool:
     tf_minutes = TF_MINUTES_MAP.get(timeframe, 30)
     last_close_utc = last_open_utc + timedelta(minutes=tf_minutes)
     age_minutes = (datetime.now(timezone.utc) - last_close_utc).total_seconds() / 60
-    return age_minutes <= 35
+    return -2 <= age_minutes <= 35
 
 
 def run(ignore_time_window: bool = False) -> None:
@@ -528,7 +568,10 @@ def run(ignore_time_window: bool = False) -> None:
                     print(f"[第一關過濾] {symbol} {tf} 無明確型態")
                     continue
 
-                print(f"[第一關命中] {symbol} {tf}: {s1.get('pattern_name')} ({s1.get('bias')})")
+                pat_name = html.escape(str(s1.get("pattern_name") or "未命名型態"))
+                bias_str = html.escape(str(s1.get("bias") or "待確認"))
+                print(f"[第一關命中] {symbol} {tf}: {pat_name} ({bias_str})")
+
                 s2 = stage2_score_risk_and_plan(symbol, tf, df, raw_chart, s1)
                 risk_score = int(s2.get("risk_score", 0))
 
@@ -542,13 +585,15 @@ def run(ignore_time_window: bool = False) -> None:
                     sl_p = float(s2.get("stop_loss") or last_price * 0.98)
                     tp_p = float(s2.get("take_profit") or last_price * 1.04)
 
-                    if not user_query and is_in_cooldown(history, symbol, tf, str(s1.get("bias")), entry_p):
-                        status_lines.append(f"• <b>{short_sym} ({tf})</b>：⏳ 同結構冷卻中（不重複發圖）")
+                    if is_in_cooldown(history, symbol, tf, str(s1.get("bias")), entry_p):
+                        status_lines.append(f"• <b>{short_sym} ({tf})</b>：⏳ 同結構冷卻中（{pat_name}，不重複發圖）")
                         print(f"[冷卻略過] {symbol} {tf} 與上次通知相同，略過重複發圖")
                         continue
 
                     risk = abs(entry_p - sl_p)
                     rr = abs(tp_p - entry_p) / risk if risk > 0 else 0
+                    risk_lvl = html.escape(str(s2.get("risk_level") or ""))
+                    summary_safe = html.escape(str(s2.get("summary") or "")[:320])
 
                     marked_chart = render_chart_png(
                         df, symbol, tf,
@@ -556,12 +601,12 @@ def run(ignore_time_window: bool = False) -> None:
                         trend_lines=s1.get("trend_lines"),
                     )
                     msg = (
-                        f"🔔 <b>AI 盯盤警報｜{symbol} ({tf})</b>\n"
-                        f"• <b>型態結構</b>：{s1.get('pattern_name')}（{s1.get('bias')}）\n"
-                        f"• <b>風險評分</b>：{risk_score}/10（{s2.get('risk_level')}）\n"
+                        f"🔔 <b>AI 盯盤警報｜{html.escape(symbol)} ({tf})</b>\n"
+                        f"• <b>型態結構</b>：{pat_name}（{bias_str}）\n"
+                        f"• <b>風險評分</b>：{risk_score}/10（{risk_lvl}）\n"
                         f"• <b>現價</b>：{_fmt_price(last_price)}（收盤 {candle_tw} UTC+8）\n"
                         f"• <b>參考規劃</b>：入場 <code>{_fmt_price(entry_p)}</code> ｜ 止損 <code>{_fmt_price(sl_p)}</code> ｜ 止盈 <code>{_fmt_price(tp_p)}</code>（R:R ≈ 1:{rr:.1f}）\n"
-                        f"• <b>AI 分析</b>：{s2.get('summary')}"
+                        f"• <b>AI 分析</b>：{summary_safe}"
                     )
                     send_telegram_photo(marked_chart, msg)
                     history[f"{symbol}|{tf}"] = {
@@ -571,16 +616,17 @@ def run(ignore_time_window: bool = False) -> None:
                         "ts": time.time(),
                     }
                     save_history(history)
-                    status_lines.append(f"• <b>{short_sym} ({tf})</b>：✅ 已發圖（{s1.get('pattern_name')}，{risk_score}/10）")
+                    status_lines.append(f"• <b>{short_sym} ({tf})</b>：✅ 已發圖（{pat_name}，{risk_score}/10）")
                     print(f"[第二關通過已推播] {symbol} {tf}: 評分 {risk_score}/10")
                 else:
                     status_lines.append(
-                        f"• <b>{short_sym} ({tf})</b>：🟡 有「{s1.get('pattern_name')}」但風險評分 {risk_score}/10（未達 {MIN_AI_CONFIDENCE} 分）"
+                        f"• <b>{short_sym} ({tf})</b>：🟡 有「{pat_name}」但風險評分 {risk_score}/10（未達 {MIN_AI_CONFIDENCE} 分）"
                     )
-                    print(f"[第二關風險過濾] {symbol} {tf} {s1.get('pattern_name')} 評分僅 {risk_score}/10")
+                    print(f"[第二關風險過濾] {symbol} {tf} {pat_name} 評分僅 {risk_score}/10")
 
             except Exception as exc:
-                err_msg = f"• <b>{short_sym} ({tf})</b>：❌ 錯誤（{str(exc)[:80]}）"
+                err_safe = html.escape(str(exc)[:80])
+                err_msg = f"• <b>{short_sym} ({tf})</b>：❌ 錯誤（{err_safe}）"
                 status_lines.append(err_msg)
                 error_lines.append(err_msg)
                 print(f"[錯誤] {symbol} {tf} 處理失敗: {exc}")
@@ -592,7 +638,7 @@ def run(ignore_time_window: bool = False) -> None:
             f"目前門檻：風險評分 ≥ <b>{MIN_AI_CONFIDENCE}/10</b>\n"
         )
         if user_query:
-            header += f"收到你的訊息：「<i>{user_query[:30]}</i>」\n\n"
+            header += f"收到你的訊息：「<i>{html.escape(user_query[:30])}</i>」\n\n"
         else:
             header += "⚠️ <b>偵測到部分項目異常：</b>\n\n"
 
